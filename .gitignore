@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+services/api/.env
+services/api/.spotify_tokens.json
+services/api/spike/out/

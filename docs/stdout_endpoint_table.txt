@@ -1,0 +1,14 @@
+endpoint | status | items | ms
+/me | 403 | 0 | 296.34
+/me/top/tracks | 403 | 0 | 147.03
+/me/top/tracks | 403 | 0 | 158.36
+/me/top/tracks | 403 | 0 | 148.62
+/me/top/artists | 403 | 0 | 153.82
+/me/top/artists | 403 | 0 | 153.49
+/me/top/artists | 403 | 0 | 153.87
+/me/player/recently-played | 403 | 0 | 153.39
+/audio-features/{top_track_id} | 0 | 0 | 0
+/audio-analysis/{top_track_id} | 0 | 0 | 0
+/recommendations | 0 | 0 | 0
+/search | 403 | 0 | 153.67
+Unique tracks gathered: 0
