@@ -13,6 +13,7 @@ starts before the revised Phase 0 criteria are evaluated.
   long = `overall`.
 - Seed Mode artist search uses Last.fm `artist.search`.
 - Era is inferred from decade tags at low confidence for now; MusicBrainz is a later option.
+- Era is scaled from 0 (oldest) to 1 (newest). Velvet Rebel has a low, older-era tendency; Echo Archivist combines low era with low mainstream.
 - Playlist export is removed. Spotify branding and Spotify ML-terms constraints no longer apply.
 
 ## Revised Phase 0 criteria

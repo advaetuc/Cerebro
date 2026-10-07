@@ -14,6 +14,7 @@ from app.services.vibe.resolver import ArtistInput, VibeResolver
 SPIKE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROFILES = SPIKE_DIR / "fixtures" / "profiles.json"
 REPORT_PATH = SPIKE_DIR / "out" / "resolver_report.json"
+EXPECTED_PATH = SPIKE_DIR / "fixtures" / "expected_archetypes.json"
 CACHE_DIR = SPIKE_DIR / ".cache"
 JUNK_TAGS = frozenset(
     {"seen live", "favorites", "favourite", "favourites", "albums i own", "spotify"}
@@ -133,25 +134,46 @@ def print_priors() -> None:
 def run_profiles(path: Path, cache: LastFmDiskCache) -> dict[str, Any]:
     """Resolve fixture profiles from the Last.fm disk cache and save results."""
     profiles = json.loads(path.read_text(encoding="utf-8"))
+    expected = json.loads(EXPECTED_PATH.read_text(encoding="utf-8"))
     resolver = VibeResolver()
     output_profiles: list[dict[str, Any]] = []
-    print("profile | archetype | signal % | top 3 families | CVV-8")
+    matched = 0
+    distinct: set[str] = set()
+    print(
+        "profile | primary | secondary | margin | Signal% | expected_ok | "
+        "top 3 families | vector"
+    )
     for profile in profiles:
         artists = [_artist_input(name, cache) for name in profile["artists"]]
         result = resolver.resolve_profile(artists)
+        primary = str(result["primary"])
+        secondary = str(result["secondary"])
+        expected_ok = primary in expected.get(profile["id"], [])
+        matched += int(expected_ok)
+        distinct.add(primary)
         row = {
             "id": profile["id"],
             "label": profile["label"],
             **result,
+            "expected_ok": expected_ok,
         }
         output_profiles.append(row)
         families = ", ".join(
             f"{item['id']} ({item['share']:.2f})" for item in result["top_families"]
         )
         print(
-            f"{profile['id']} | {result['archetype']} | {result['signal_strength_pct']:.2f} | "
-            f"{families} | {_vector_string(result['vector'])}"
+            f"{profile['id']} | {primary} | {secondary} | {result['margin']:.3f} | "
+            f"{result['signal_strength_pct']:.2f} | {expected_ok} | {families} | "
+            f"{_vector_string(result['vector'])}"
         )
+    print(f"matched {matched}/{len(profiles)}, distinct {len(distinct)}")
+    if matched < 8 or len(distinct) < 6:
+        misses = [
+            f"{row['id']} primary={row['primary']} vector={_vector_string(row['vector'])}"
+            for row in output_profiles
+            if not row["expected_ok"]
+        ]
+        print("calibration misses: " + "; ".join(misses))
     report = {"profiles": output_profiles}
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")

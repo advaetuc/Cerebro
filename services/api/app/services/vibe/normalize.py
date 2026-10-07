@@ -30,7 +30,6 @@ NOISE_TAGS = frozenset(
         "beautiful",
         "love",
         "music",
-        "seen-live",
         "listened-to",
         "favorite-artists",
     }

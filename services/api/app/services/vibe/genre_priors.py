@@ -137,19 +137,19 @@ FAMILIES = (
     GenreFamily("bebop", ("bebop", "be-bop", "hard bop"), (.64, .68, .45, .55, .45, .69, .30, .55)),
     GenreFamily(
         "classical", ("classical", "classical music", "orchestral"),
-        (.30, .55, .75, .10, .83, .20, .24, .72),
+        (.30, .55, .75, .10, .83, .20, .24, .35),
     ),
     GenreFamily(
         "baroque", ("baroque", "baroque classical", "early music"),
-        (.32, .62, .75, .14, .86, .20, .18, .64),
+        (.32, .62, .75, .14, .86, .20, .18, .35),
     ),
     GenreFamily(
         "contemporary-classical", ("contemporary classical", "modern classical", "neo-classical"),
-        (.28, .55, .80, .12, .82, .18, .90, .54),
+        (.28, .55, .80, .12, .82, .18, .90, .35),
     ),
     GenreFamily(
         "piano", ("piano", "solo piano", "piano music", "neoclassical piano"),
-        (.32, .62, .77, .23, .70, .20, .60, .80),
+        (.32, .62, .77, .23, .70, .20, .60, .55),
     ),
     GenreFamily(
         "folk", ("folk", "traditional folk", "english folk", "indian folk"),

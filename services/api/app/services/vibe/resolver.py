@@ -6,24 +6,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from .archetypes import match_archetypes
 from .genre_priors import DIMENSIONS, FAMILY_BY_ID
-from .normalize import normalize_and_classify
+from .normalize import ORIGIN_TAGS, normalize_and_classify, normalize_tag
 
 T2_WEIGHT = 0.5
 T3_WEIGHT = 0.35
-TAG_ONLY_SIGNAL_CAP = 65.0
+TAG_ONLY_SIGNAL_SCALE = 65.0
 DEFAULT_VECTOR = {dimension: 0.5 for dimension in DIMENSIONS}
-
-ARCHETYPES = {
-    "Neon Insomniac": (0.82, 0.25, 0.15, 0.82, 0.25, 0.78, 0.55, 0.70),
-    "Golden Hour Dreamer": (0.52, 0.84, 0.78, 0.56, 0.20, 0.48, 0.62, 0.55),
-    "Static Saint": (0.24, 0.30, 0.70, 0.18, 0.87, 0.22, 0.54, 0.27),
-    "Velvet Rebel": (0.56, 0.28, 0.24, 0.46, 0.18, 0.53, 0.28, 0.50),
-    "Solar Sprinter": (0.90, 0.84, 0.18, 0.86, 0.08, 0.91, 0.78, 0.73),
-    "Hollow Wanderer": (0.25, 0.24, 0.82, 0.22, 0.35, 0.28, 0.48, 0.30),
-    "Chrome Romantic": (0.68, 0.86, 0.20, 0.91, 0.06, 0.70, 0.78, 0.78),
-    "Echo Archivist": (0.42, 0.48, 0.56, 0.36, 0.38, 0.40, 0.88, 0.22),
-}
 
 
 @dataclass(frozen=True)
@@ -52,15 +42,6 @@ def blend_mainstream(data_value: float | None, prior_value: float) -> float:
     return 0.7 * data_value + 0.3 * prior_value
 
 
-def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
-    numerator = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return numerator / (left_norm * right_norm)
-
-
 def _decade_value(year: int) -> float:
     return min(1.0, max(0.0, (year - 1950) / 70.0))
 
@@ -74,6 +55,7 @@ class VibeResolver:
         decade_weights: list[tuple[int, float]] = []
         total_tag_weight = 0.0
         mapped_tag_weight = 0.0
+        coverage_tag_weight = 0.0
         for tag in artist.tags:
             raw_name = str(tag.get("name", ""))
             try:
@@ -84,11 +66,14 @@ class VibeResolver:
             weight = raw_weight * (0.5 if is_borrowed else 1.0)
             total_tag_weight += weight
             normalized = normalize_and_classify(raw_name)
+            if normalized.kind == "origin" and normalize_tag(raw_name) in ORIGIN_TAGS:
+                coverage_tag_weight += weight
             if normalized.kind == "genre" and normalized.family_id:
                 family_weights[normalized.family_id] = (
                     family_weights.get(normalized.family_id, 0.0) + weight
                 )
                 mapped_tag_weight += weight
+                coverage_tag_weight += weight
             elif normalized.kind == "decade" and normalized.decade_year is not None:
                 decade_weights.append((normalized.decade_year, weight))
 
@@ -101,7 +86,7 @@ class VibeResolver:
         vector = dict(DEFAULT_VECTOR)
         confidence = {dimension: 0.0 for dimension in DIMENSIONS}
         family_prior = dict(DEFAULT_VECTOR)
-        tag_coverage = mapped_tag_weight / total_tag_weight if total_tag_weight else 0.0
+        tag_coverage = coverage_tag_weight / total_tag_weight if total_tag_weight else 0.0
         if distribution:
             for index, dimension in enumerate(DIMENSIONS):
                 tag_projection = sum(
@@ -138,6 +123,7 @@ class VibeResolver:
             "confidence": confidence,
             "family_distribution": distribution,
             "mapped_tag_weight": mapped_tag_weight,
+            "coverage_tag_weight": coverage_tag_weight,
             "total_tag_weight": total_tag_weight,
             "borrowed": artist.borrowed,
             "play_weight": max(0.0, artist.play_weight),
@@ -169,8 +155,8 @@ class VibeResolver:
             )
 
         total_tag_weight = sum(item["total_tag_weight"] for item in resolved)
-        mapped_tag_weight = sum(item["mapped_tag_weight"] for item in resolved)
-        coverage = mapped_tag_weight / total_tag_weight if total_tag_weight else 0.0
+        coverage_tag_weight = sum(item["coverage_tag_weight"] for item in resolved)
+        coverage = coverage_tag_weight / total_tag_weight if total_tag_weight else 0.0
         total_play_weight = sum(math.sqrt(item["play_weight"]) for item in resolved)
         borrowed_weight = sum(
             math.sqrt(item["play_weight"])
@@ -179,11 +165,8 @@ class VibeResolver:
         )
         borrowed_share = borrowed_weight / total_play_weight if total_play_weight else 0.0
         artist_factor = min(1.0, math.sqrt(len(resolved) / 10.0))
-        signal_strength = min(
-            TAG_ONLY_SIGNAL_CAP,
-            100.0 * (T2_WEIGHT + T3_WEIGHT) * coverage * artist_factor
-            * (1.0 - 0.5 * borrowed_share),
-        )
+        raw_quality = coverage * artist_factor * (1.0 - 0.5 * borrowed_share)
+        signal_strength = TAG_ONLY_SIGNAL_SCALE * raw_quality
         family_totals: dict[str, float] = {}
         for item in resolved:
             play_weight = math.sqrt(item["play_weight"])
@@ -196,16 +179,13 @@ class VibeResolver:
                 family_totals.items(), key=lambda entry: (-entry[1], entry[0])
             )[:3]
         ] if family_denominator else []
-        vector_tuple = tuple(dimension_values[dimension] for dimension in DIMENSIONS)
-        archetype = max(
-            ARCHETYPES,
-            key=lambda name: _cosine(vector_tuple, ARCHETYPES[name]),
-        )
+        archetype_match = match_archetypes(dimension_values)
         return {
             "vector": dimension_values,
             "confidence": dimension_confidence,
             "signal_strength_pct": round(signal_strength, 2),
-            "archetype": archetype,
+            "archetype": archetype_match["primary"],
+            **archetype_match,
             "top_families": top_families,
             "artists": resolved,
         }
