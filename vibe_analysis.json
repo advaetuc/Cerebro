@@ -1,0 +1,220 @@
+﻿{
+    "vector":  {
+                   "energy":  0.6651272823973419,
+                   "valence":  0.5336957963126793,
+                   "acousticness":  0.3349833286876294,
+                   "danceability":  0.6065558075845531,
+                   "instrumentalness":  0.15599910318428448,
+                   "tempo":  0.6401825732665657,
+                   "era":  0.6229216028952957,
+                   "mainstream":  0.7651834142523474
+               },
+    "signal_pct":  20.27,
+    "archetype":  "Neon Insomniac",
+    "secondary":  "Solar Sprinter",
+    "margin":  0.2702,
+    "top_families":  [
+                         {
+                             "id":  "hip-hop",
+                             "share":  0.26264591439688717
+                         },
+                         {
+                             "id":  "soundtrack",
+                             "share":  0.2032520325203252
+                         },
+                         {
+                             "id":  "alt-indie-rock",
+                             "share":  0.1761006289308176
+                         }
+                     ],
+    "movies":  [
+                   {
+                       "id":  "1621552",
+                       "title":  "Facing El Chapo",
+                       "year":  "2026",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/alpf5v4UqSFawPmG9RX03Or4BDk.jpg",
+                       "score":  0.6629,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/1621552"
+                   },
+                   {
+                       "id":  "687163",
+                       "title":  "Project Hail Mary",
+                       "year":  "2026",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/iOb2fjXLbpJgyQXe46n1WtGCnaa.jpg",
+                       "score":  0.6574,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/687163"
+                   },
+                   {
+                       "id":  "1375646",
+                       "title":  "Colony",
+                       "year":  "2026",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/tN799oUR0f1gUKDYdMNrDaY7I51.jpg",
+                       "score":  0.6421,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/1375646"
+                   },
+                   {
+                       "id":  "569094",
+                       "title":  "Spider-Man: Across the Spider-Verse",
+                       "year":  "2023",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg",
+                       "score":  0.6484,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/569094"
+                   },
+                   {
+                       "id":  "533535",
+                       "title":  "Deadpool \u0026 Wolverine",
+                       "year":  "2024",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/8cdWjvZQUExUUTzyp4t6EDMubfO.jpg",
+                       "score":  0.627,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/533535"
+                   },
+                   {
+                       "id":  "1184918",
+                       "title":  "The Wild Robot",
+                       "year":  "2024",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/wTnV3PCVW5O92JMrFvvrRcV39RU.jpg",
+                       "score":  0.6484,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/1184918"
+                   },
+                   {
+                       "id":  "205596",
+                       "title":  "The Imitation Game",
+                       "year":  "2014",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/zSqJ1qFq8NXFfi7JeIYMlzyR0dx.jpg",
+                       "score":  0.4471,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/205596"
+                   },
+                   {
+                       "id":  "157336",
+                       "title":  "Interstellar",
+                       "year":  "2014",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/yQvGrMoipbRoddT0ZR8tPoR7NfX.jpg",
+                       "score":  0.6541,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/157336"
+                   },
+                   {
+                       "id":  "603",
+                       "title":  "The Matrix",
+                       "year":  "1999",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/dXNAPwY7VrqMAo51EKhhCJfaGb5.jpg",
+                       "score":  0.6472,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/603"
+                   },
+                   {
+                       "id":  "1339713",
+                       "title":  "Obsession",
+                       "year":  "2026",
+                       "image_url":  "https://image.tmdb.org/t/p/w342/bRwnj8WEKBCvmfeUNOukJPwB43K.jpg",
+                       "score":  0.4518,
+                       "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                       "source_url":  "https://www.themoviedb.org/movie/1339713"
+                   }
+               ],
+    "games":  [
+                  {
+                      "id":  "45131",
+                      "title":  "Grand Theft Auto V: Special Edition",
+                      "year":  "2013",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co2nbc.jpg",
+                      "score":  0.6973,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/45131"
+                  },
+                  {
+                      "id":  "42931",
+                      "title":  "Bloodborne: Game of the Year Edition",
+                      "year":  "2015",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co4vui.jpg",
+                      "score":  0.6907,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/42931"
+                  },
+                  {
+                      "id":  "1627",
+                      "title":  "Super Smash Bros. Melee",
+                      "year":  "2001",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co21yv.jpg",
+                      "score":  0.6825,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/1627"
+                  },
+                  {
+                      "id":  "1026",
+                      "title":  "The Legend of Zelda: A Link to the Past",
+                      "year":  "1991",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co3vzn.jpg",
+                      "score":  0.6873,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/1026"
+                  },
+                  {
+                      "id":  "47304",
+                      "title":  "American Chopper",
+                      "year":  "2004",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/cobouw.jpg",
+                      "score":  0.6931,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/47304"
+                  },
+                  {
+                      "id":  "1070",
+                      "title":  "Super Mario World",
+                      "year":  "1990",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co8lo8.jpg",
+                      "score":  0.6869,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/1070"
+                  },
+                  {
+                      "id":  "119171",
+                      "title":  "Baldur\u0027s Gate III",
+                      "year":  "2023",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co670h.jpg",
+                      "score":  0.6837,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/119171"
+                  },
+                  {
+                      "id":  "19560",
+                      "title":  "God of War",
+                      "year":  "2018",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/cobkt6.jpg",
+                      "score":  0.6818,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/19560"
+                  },
+                  {
+                      "id":  "109241",
+                      "title":  "The Binding of Isaac: Repentance",
+                      "year":  "2021",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/co5dfa.jpg",
+                      "score":  0.6803,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/109241"
+                  },
+                  {
+                      "id":  "318395",
+                      "title":  "Animal Company",
+                      "year":  "2024",
+                      "image_url":  "https://images.igdb.com/igdb/image/upload/t_cover_big/coauu2.jpg",
+                      "score":  0.6893,
+                      "why":  "Low instrumentalness, High era: matches your late-night, driving taste.",
+                      "source_url":  "https://www.igdb.com/games/318395"
+                  }
+              ],
+    "attribution":  [
+                        "Data provided by Last.fm",
+                        "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+                        "IGDB data provided by Twitch Interactive, Inc."
+                    ],
+    "degraded":  true
+}

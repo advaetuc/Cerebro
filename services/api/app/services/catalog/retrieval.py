@@ -1,0 +1,571 @@
+"""Measure cached and cold TMDB and IGDB candidate retrieval."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import statistics
+import time
+from pathlib import Path
+from typing import Any
+
+from .clients import (
+    CatalogClients,
+    CatalogResult,
+    build_apicalypse,
+    build_multiquery,
+    build_tmdb_params,
+)
+
+SPIKE_DIR = Path(__file__).resolve().parents[3] / "spike"
+BLUEPRINT_PATH = SPIKE_DIR.parents[2] / "docs" / "cerebro_blueprint.md"
+REPORT_PATH = SPIKE_DIR / "out" / "catalog_report.json"
+
+INTENTS: dict[str, dict[str, Any]] = {
+    "Neon Insomniac": {
+        "tmdb_genres": ["Science Fiction", "Thriller"],
+        "tmdb_keywords": ["cyberpunk", "neo-noir", "rhythm"],
+        "igdb_genres": ["Shooter", "Role-playing (RPG)"],
+        "igdb_themes": ["Action", "Science fiction", "Cyberpunk"],
+    },
+    "Golden Hour Dreamer": {
+        "tmdb_genres": ["Drama", "Romance"],
+        "tmdb_keywords": ["coming of age", "road movie", "romance"],
+        "igdb_genres": ["Adventure", "Indie"],
+        "igdb_themes": ["Fantasy", "Open world", "Narrative"],
+    },
+    "Static Saint": {
+        "tmdb_genres": ["Drama", "Science Fiction"],
+        "tmdb_keywords": ["slow cinema", "space", "atmospheric"],
+        "igdb_genres": ["Puzzle", "Adventure"],
+        "igdb_themes": ["Science fiction", "Atmospheric", "Mystery"],
+    },
+    "Velvet Rebel": {
+        "tmdb_genres": ["Crime", "Drama"],
+        "tmdb_keywords": ["character study", "stealth", "crime"],
+        "igdb_genres": ["Role-playing (RPG)", "Adventure"],
+        "igdb_themes": ["Stealth", "Action", "Dark"],
+    },
+    "Solar Sprinter": {
+        "tmdb_genres": ["Action", "Adventure"],
+        "tmdb_keywords": ["action comedy", "racing", "adventure"],
+        "igdb_genres": ["Platform", "Racing"],
+        "igdb_themes": ["Action", "Comedy", "Arcade"],
+    },
+    "Hollow Wanderer": {
+        "tmdb_genres": ["Drama", "Horror"],
+        "tmdb_keywords": ["folk horror", "survival", "quiet"],
+        "igdb_genres": ["Adventure", "Indie"],
+        "igdb_themes": ["Survival", "Horror", "Fantasy"],
+    },
+    "Chrome Romantic": {
+        "tmdb_genres": ["Comedy", "Music"],
+        "tmdb_keywords": ["musical", "romantic comedy", "retro futurism"],
+        "igdb_genres": ["Music", "Party"],
+        "igdb_themes": ["Music", "Comedy", "Co-operative"],
+    },
+    "Echo Archivist": {
+        "tmdb_genres": ["Documentary", "History"],
+        "tmdb_keywords": ["classic film", "cult film", "historical"],
+        "tmdb_date_range": ("1900-01-01", "2005-12-31"),
+        "igdb_genres": ["Strategy", "Indie"],
+        "igdb_themes": ["Turn-based strategy", "4X", "Retro"],
+        "mapping_note": "Retro/niche indie/deep strategy; 4X and turn-based, no war themes.",
+    },
+}
+
+
+def _items(result: CatalogResult, key: str | None = None) -> list[dict[str, Any]]:
+    payload = result.data
+    if key and isinstance(payload, dict):
+        payload = payload.get(key, [])
+    if isinstance(payload, dict):
+        return [payload]
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+def _name_ids(items: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        str(item["name"]).strip().casefold(): int(item["id"])
+        for item in items
+        if item.get("name") is not None and item.get("id") is not None
+    }
+
+
+async def _prepare(clients: CatalogClients) -> dict[str, Any]:
+    """Resolve every catalog name before retrieval timing begins."""
+    keyword_names = sorted(
+        {name for intent in INTENTS.values() for name in intent["tmdb_keywords"]}
+    )
+    tmdb_genres, igdb_genres, igdb_themes, *keywords = await asyncio.gather(
+        clients.tmdb_genres(),
+        clients.igdb_genres(),
+        clients.igdb_themes(),
+        *(clients.tmdb_keyword(name) for name in keyword_names),
+    )
+    keyword_results = dict(zip(keyword_names, keywords, strict=True))
+    return {
+        "tmdb_genres": _name_ids(_items(tmdb_genres, "genres")),
+        "tmdb_keywords": {
+            name.casefold(): (
+                int(_items(result, "results")[0]["id"])
+                if _items(result, "results") and _items(result, "results")[0].get("id") is not None
+                else None
+            )
+            for name, result in keyword_results.items()
+        },
+        "keyword_results": {name.casefold(): result for name, result in keyword_results.items()},
+        "igdb_genres": _name_ids(_items(igdb_genres)),
+        "igdb_themes": _name_ids(_items(igdb_themes)),
+        "boot_results": [tmdb_genres, igdb_genres, igdb_themes, *keywords],
+    }
+
+
+def _tmdb_ids(intent: dict[str, Any], ids: dict[str, Any]) -> tuple[list[int], list[int]]:
+    genres = [
+        ids["tmdb_genres"][name.casefold()]
+        for name in intent["tmdb_genres"]
+        if name.casefold() in ids["tmdb_genres"]
+    ]
+    keywords = [
+        ids["tmdb_keywords"][name.casefold()]
+        for name in intent["tmdb_keywords"]
+        if ids["tmdb_keywords"].get(name.casefold()) is not None
+    ]
+    return genres, keywords
+
+
+def _tmdb_queries(
+    intent: dict[str, Any], ids: dict[str, Any], rung: str
+) -> list[dict[str, str | int]]:
+    genres, keywords = _tmdb_ids(intent, ids)
+    if rung == "a":
+        query_groups = [(genres, keywords, intent.get("tmdb_date_range"))]
+    elif rung == "b":
+        query_groups = [(genres, keywords, None)]
+    elif rung == "c":
+        query_groups = [(genres, [], None)]
+    else:
+        return []
+    query_groups = [group for group in query_groups if any(group)]
+    return [
+        build_tmdb_params(group_genres, group_keywords, page, date_range)
+        for group_genres, group_keywords, date_range in query_groups
+        for page in (1, 2)
+    ]
+
+
+def _igdb_query_bodies(intent: dict[str, Any], ids: dict[str, Any]) -> list[tuple[str, str]]:
+    genre_ids = [
+        ids["igdb_genres"][name.casefold()]
+        for name in intent["igdb_genres"]
+        if name.casefold() in ids["igdb_genres"]
+    ]
+    theme_ids = [
+        ids["igdb_themes"][name.casefold()]
+        for name in intent["igdb_themes"]
+        if name.casefold() in ids["igdb_themes"]
+    ]
+    genres = genre_ids
+    themes = theme_ids
+    return [
+        ("genres", build_apicalypse(genres, themes, "genres")),
+        ("themes", build_apicalypse(genres, themes, "themes")),
+        ("combined", build_apicalypse(genres, themes, "combined")),
+    ]
+
+
+def _igdb_queries(intent: dict[str, Any], ids: dict[str, Any]) -> list[str]:
+    return [body for _, body in _igdb_query_bodies(intent, ids)]
+
+
+async def _fetch_intent(
+    clients: CatalogClients,
+    intent: dict[str, list[str]],
+    ids: dict[str, Any],
+    cold: bool,
+) -> dict[str, Any]:
+    """Fetch movie candidates through a three-rung fallback ladder."""
+    started = time.perf_counter()
+    all_calls: list[CatalogResult] = []
+    selected_items: list[dict[str, Any]] = []
+    rung_used = "c"
+    for rung in ("a", "b", "c"):
+        queries = _tmdb_queries(intent, ids, rung)
+        calls = await asyncio.gather(
+            *(clients.tmdb_discover(query, cold=cold) for query in queries)
+        )
+        all_calls.extend(calls)
+        selected_items = _dedupe(calls, "results")
+        rung_used = rung
+        if len(selected_items) >= 60:
+            break
+    unresolved = [
+        name for name in intent["tmdb_keywords"]
+        if ids["tmdb_keywords"].get(name.casefold()) is None
+    ]
+    degraded = (
+        rung_used != "a"
+        or len(selected_items) < 60
+        or bool(unresolved)
+        or any(not result.ok for result in all_calls)
+    )
+    return {
+        "items": selected_items,
+        "calls": all_calls,
+        "rung_used": rung_used,
+        "unresolved_keywords": unresolved,
+        "degraded": degraded,
+        "movie_ms": (time.perf_counter() - started) * 1000,
+    }
+
+
+def _game_items(result: CatalogResult) -> list[dict[str, Any]]:
+    """Extract games from regular and multiquery response shapes."""
+    if result.endpoint != "multiquery":
+        return _items(result)
+    found: list[dict[str, Any]] = []
+    if isinstance(result.data, list):
+        for section in result.data:
+            if isinstance(section, dict):
+                records = section.get("result", [])
+                if isinstance(records, list):
+                    found.extend(item for item in records if isinstance(item, dict))
+    return found
+
+
+def _dedupe_games(results: list[CatalogResult]) -> list[dict[str, Any]]:
+    """Deduplicate separate and multiquery game candidates by ID."""
+    found: dict[str, dict[str, Any]] = {}
+    for result in results:
+        for item in _game_items(result):
+            if item.get("id") is not None:
+                found.setdefault(str(item["id"]), item)
+    return list(found.values())
+
+
+async def _fetch_igdb_approach(
+    clients: CatalogClients,
+    bodies: list[tuple[str, str]],
+    mode: str,
+    cold: bool,
+) -> dict[str, Any]:
+    """Run either three IGDB requests or one multiquery request."""
+    started = time.perf_counter()
+    if mode == "separate":
+        calls = await asyncio.gather(
+            *(clients.igdb_games(body, cold=cold) for _, body in bodies)
+        )
+    else:
+        calls = [
+            await clients.igdb_multiquery(build_multiquery(bodies), cold=cold)
+        ]
+    total_ms = (time.perf_counter() - started) * 1000
+    return {
+        "calls": calls,
+        "items": _dedupe_games(calls),
+        "total_ms": total_ms,
+        "api_ms": max((call.api_ms for call in calls), default=0.0),
+    }
+
+
+def _dedupe(results: list[CatalogResult], key: str) -> list[dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for result in results:
+        for item in _items(result, key):
+            item_id = item.get("id")
+            if item_id is not None:
+                found.setdefault(str(item_id), item)
+    return list(found.values())
+
+
+def _latency_stats(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"p50": None, "max": None}
+    return {"p50": round(statistics.median(values), 2), "max": round(max(values), 2)}
+
+
+def _call_metrics(results: list[CatalogResult], item_key: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "endpoint": result.endpoint,
+            "status": result.status,
+            "error_code": result.error_code,
+            "error_detail": result.error_detail,
+            "attempt": result.attempt,
+            "latency_ms": round(result.latency_ms, 2),
+            "limiter_wait_ms": round(result.limiter_wait_ms, 2),
+            "api_ms": round(result.api_ms, 2),
+            "status_error": (
+                result.error_message[:120]
+                if result.error_code is not None and result.error_detail is None
+                else None
+            ),
+            "item_count": len(_items(result, item_key)),
+        }
+        for result in results
+    ]
+
+
+def _game_call_metrics(results: list[CatalogResult]) -> list[dict[str, Any]]:
+    """Build per-call metrics for separate or multiquery IGDB responses."""
+    return [
+        {
+            "endpoint": result.endpoint,
+            "status": result.status,
+            "error_code": result.error_code,
+            "error_detail": result.error_detail,
+            "attempt": result.attempt,
+            "latency_ms": round(result.latency_ms, 2),
+            "limiter_wait_ms": round(result.limiter_wait_ms, 2),
+            "api_ms": round(result.api_ms, 2),
+            "status_error": (
+                result.error_message[:120]
+                if result.error_code is not None and result.error_detail is None
+                else None
+            ),
+            "item_count": len(_game_items(result)),
+        }
+        for result in results
+    ]
+
+
+def _jaccard_report(profiles: list[dict[str, Any]], id_key: str) -> dict[str, Any]:
+    """Calculate all pairwise candidate-ID Jaccard similarities."""
+    pairs = []
+    for left_index, left in enumerate(profiles):
+        left_ids = set(left[id_key])
+        for right in profiles[left_index + 1 :]:
+            right_ids = set(right[id_key])
+            union = left_ids | right_ids
+            score = len(left_ids & right_ids) / len(union) if union else 0.0
+            pairs.append({
+                "left": left["archetype"],
+                "right": right["archetype"],
+                "jaccard": round(score, 4),
+                "overlap_flag": score > 0.5,
+            })
+    scores = [pair["jaccard"] for pair in pairs]
+    return {
+        "mean": round(statistics.mean(scores), 4) if scores else 0.0,
+        "max": max(scores, default=0.0),
+        "flagged_pairs": [pair for pair in pairs if pair["overlap_flag"]],
+        "pairs": pairs,
+    }
+
+
+def _table_lines(report: dict[str, Any]) -> list[str]:
+    """Build stdout lines from the completed report rows."""
+    lines = [
+        "archetype | movies | games | rung | degraded | unresolved kw | "
+        "movie_ms p50/max | game_ms total/api p50/max | total_ms p50/max | "
+        "top movies | top games"
+    ]
+    for result in report["archetypes"]:
+        latency = result["latency_ms"]
+        lines.append(
+            f"{result['archetype']} | {result['movie_count']} | {result['game_count']} | "
+            f"{result['rung_used']} | {result['degraded']} | "
+            f"{', '.join(result['unresolved_keywords']) or '-'} | "
+            f"{_format_stats(latency['movie_ms'])} | "
+            f"{_format_stats(latency['game_total_ms'])}/"
+            f"{_format_stats(latency['game_api_ms'])} | "
+            f"{_format_stats(latency['total_ms'])} | "
+            f"{', '.join(result['top_movie_titles'])} | "
+            f"{', '.join(result['top_game_titles'])}"
+        )
+    return lines
+
+
+def _approach_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize total and API-only IGDB latency for an approach."""
+    return {
+        "total_ms": _latency_stats([sample["total_ms"] for sample in samples]),
+        "api_ms": _latency_stats([sample["api_ms"] for sample in samples]),
+        "http_requests_per_run": 3 if samples and samples[0]["mode"] == "separate" else 1,
+        "subqueries_per_run": 3,
+    }
+
+
+async def run_probe(cold: bool = False, igdb_mode: str = "auto") -> dict[str, Any]:
+    """Run the catalog latency spike and save its report."""
+    clients = CatalogClients()
+    try:
+        connection_times = {
+            "tmdb": await clients.measure_connect_tls("tmdb"),
+            "igdb": await clients.measure_connect_tls("igdb"),
+        }
+        ids = await _prepare(clients)
+        profile_runs: list[dict[str, Any]] = []
+        for archetype, intent in INTENTS.items():
+            runs: list[dict[str, Any]] = []
+            bodies = _igdb_query_bodies(intent, ids)
+            for repeat in range(3):
+                force_cold = cold or repeat == 0
+                started = time.perf_counter()
+                movie_run, separate_run, multiquery_run = await asyncio.gather(
+                    _fetch_intent(clients, intent, ids, force_cold),
+                    _fetch_igdb_approach(clients, bodies, "separate", force_cold),
+                    _fetch_igdb_approach(clients, bodies, "multiquery", force_cold),
+                )
+                runs.append({
+                    "movie": movie_run,
+                    "separate": separate_run,
+                    "multiquery": multiquery_run,
+                    "total_ms": (time.perf_counter() - started) * 1000,
+                    "kind": "cold" if force_cold else "warm",
+                })
+            profile_runs.append({
+                "archetype": archetype,
+                "intent": intent,
+                "runs": runs,
+            })
+        approach_samples = {
+            mode: [
+                {"total_ms": run[mode]["total_ms"], "api_ms": run[mode]["api_ms"], "mode": mode}
+                for profile in profile_runs
+                for run in profile["runs"]
+            ]
+            for mode in ("separate", "multiquery")
+        }
+        measured_default = min(
+            approach_samples,
+            key=lambda mode: statistics.median(
+                sample["total_ms"] for sample in approach_samples[mode]
+            ),
+        )
+        selected_mode = measured_default if igdb_mode == "auto" else igdb_mode
+        report_rows = []
+        for profile in profile_runs:
+            runs = profile["runs"]
+            intent = profile["intent"]
+            movie_calls = [call for run in runs for call in run["movie"]["calls"]]
+            movie_items = _dedupe(movie_calls, "results")
+            selected_calls = [
+                call for run in runs for call in run[selected_mode]["calls"]
+            ]
+            game_items = _dedupe_games(selected_calls)
+            unresolved = [
+                name for name in intent["tmdb_keywords"]
+                if ids["tmdb_keywords"].get(name.casefold()) is None
+            ]
+            movie_stats = _latency_stats([run["movie"]["movie_ms"] for run in runs])
+            game_total_stats = _latency_stats(
+                [run[selected_mode]["total_ms"] for run in runs]
+            )
+            game_api_stats = _latency_stats(
+                [run[selected_mode]["api_ms"] for run in runs]
+            )
+            total_stats = _latency_stats(
+                [max(run["movie"]["movie_ms"], run[selected_mode]["total_ms"])
+                 for run in runs]
+            )
+            rung_used = runs[0]["movie"]["rung_used"]
+            degraded = (
+                any(run["movie"]["degraded"] for run in runs)
+                or bool(unresolved)
+                or len(movie_items) < 60
+                or any(not call.ok for call in selected_calls)
+            )
+            keyword_metrics = {}
+            for name in intent["tmdb_keywords"]:
+                result = ids["keyword_results"][name.casefold()]
+                keyword_metrics[name] = _call_metrics([result], "results")[0]
+            report_rows.append({
+                "archetype": profile["archetype"],
+                "movie_count": len(movie_items),
+                "game_count": len(game_items),
+                "rung_used": rung_used,
+                "degraded": degraded,
+                "unresolved_keywords": unresolved,
+                "keyword_lookups": keyword_metrics,
+                "latency_ms": {
+                    "movie_ms": movie_stats,
+                    "game_total_ms": game_total_stats,
+                    "game_api_ms": game_api_stats,
+                    "total_ms": total_stats,
+                },
+                "igdb_mode": selected_mode,
+                "igdb_mapping_note": intent.get("mapping_note"),
+                "igdb_approaches": {
+                    mode: {
+                        **_approach_summary([
+                            {
+                                "mode": mode,
+                                "total_ms": run[mode]["total_ms"],
+                                "api_ms": run[mode]["api_ms"],
+                            }
+                            for run in runs
+                        ]),
+                        "calls": _game_call_metrics([
+                            call for run in runs for call in run[mode]["calls"]
+                        ]),
+                    }
+                    for mode in ("separate", "multiquery")
+                },
+                "calls": {
+                    "tmdb": _call_metrics(movie_calls, "results"),
+                    "igdb": _game_call_metrics(selected_calls),
+                },
+                "top_movie_titles": [item.get("title", "") for item in movie_items[:5]],
+                "top_game_titles": [item.get("name", "") for item in game_items[:5]],
+                "movie_ids": [item["id"] for item in movie_items],
+                "game_ids": [item["id"] for item in game_items],
+            })
+        movie_jaccard = _jaccard_report(report_rows, "movie_ids")
+        game_jaccard = _jaccard_report(report_rows, "game_ids")
+        report = {
+            "cold_requested": cold,
+            "igdb_mode_requested": igdb_mode,
+            "igdb_default_mode": measured_default,
+            "igdb_request_count_basis": (
+                "HTTP requests sent by this probe; multiquery contains "
+                "3 subqueries in 1 request."
+            ),
+            "connect_tls": connection_times,
+            "differentiation": {"movies": movie_jaccard, "games": game_jaccard},
+            "id_list_boot_calls": [
+                _call_metrics([result], "")[0]
+                for result in ids["boot_results"]
+            ],
+            "archetypes": report_rows,
+        }
+        for row in report_rows:
+            row.pop("movie_ids")
+            row.pop("game_ids")
+        REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        for line in _table_lines(report):
+            print(line)
+        print(
+            "Jaccard movies mean/max | "
+            f"{movie_jaccard['mean']}/{movie_jaccard['max']}"
+        )
+        print(
+            "Jaccard games mean/max | "
+            f"{game_jaccard['mean']}/{game_jaccard['max']}"
+        )
+        print(f"IGDB default mode | {measured_default}")
+        print(f"connect+TLS | TMDB {connection_times['tmdb']} | IGDB {connection_times['igdb']}")
+        return report
+    finally:
+        await clients.close()
+
+
+def _format_stats(stats: dict[str, float | None]) -> str:
+    return f"{stats['p50']}/{stats['max']}"
+
+
+def main() -> int:
+    """Run the async catalog retrieval probe."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cold", action="store_true")
+    parser.add_argument("--igdb-mode", choices=("auto", "separate", "multiquery"), default="auto")
+    args = parser.parse_args()
+    asyncio.run(run_probe(cold=args.cold, igdb_mode=args.igdb_mode))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
