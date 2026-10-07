@@ -1,0 +1,212 @@
+[
+  {
+    "id": "p01",
+    "label": "Hindi Film Classics",
+    "artists": [
+      "Asha Bhosle",
+      "Kishore Kumar",
+      "Lata Mangeshkar",
+      "Mohammed Rafi",
+      "R. D. Burman",
+      "A. R. Rahman",
+      "Shreya Ghoshal",
+      "Sonu Nigam",
+      "Arijit Singh",
+      "Sunidhi Chauhan",
+      "Vishal-Shekhar",
+      "Pritam",
+      "Amit Trivedi",
+      "S. D. Burman",
+      "KK"
+    ]
+  },
+  {
+    "id": "p02",
+    "label": "Punjabi and Haryanvi",
+    "artists": [
+      "Sidhu Moose Wala",
+      "Diljit Dosanjh",
+      "AP Dhillon",
+      "Karan Aujla",
+      "Shubh",
+      "Gurdas Maan",
+      "Amrinder Gill",
+      "Jazzy B",
+      "Babbu Maan",
+      "Surjit Bindrakhia",
+      "Bohemia",
+      "Ranjit Bawa",
+      "Masoom Sharma",
+      "Sapna Choudhary",
+      "Amit Saini Rohtakiya"
+    ]
+  },
+  {
+    "id": "p03",
+    "label": "Desi Hip-Hop and Indie",
+    "artists": [
+      "Divine",
+      "Naezy",
+      "Prateek Kuhad",
+      "Ritviz",
+      "When Chai Met Toast",
+      "The Local Train",
+      "Seedhe Maut",
+      "KR$NA",
+      "Emiway Bantai",
+      "Raftaar",
+      "MC Stan",
+      "Hanumankind",
+      "Brodha V",
+      "Anuv Jain",
+      "Nucleya"
+    ]
+  },
+  {
+    "id": "p04",
+    "label": "Mainstream Pop",
+    "artists": [
+      "Taylor Swift",
+      "Beyoncé",
+      "Rihanna",
+      "Lady Gaga",
+      "Ariana Grande",
+      "Dua Lipa",
+      "Billie Eilish",
+      "Bruno Mars",
+      "The Weeknd",
+      "Justin Bieber",
+      "Ed Sheeran",
+      "Adele",
+      "Katy Perry",
+      "Miley Cyrus",
+      "Olivia Rodrigo"
+    ]
+  },
+  {
+    "id": "p05",
+    "label": "Global Hip-Hop",
+    "artists": [
+      "Kendrick Lamar",
+      "Drake",
+      "J. Cole",
+      "Eminem",
+      "Jay-Z",
+      "Nas",
+      "2Pac",
+      "The Notorious B.I.G.",
+      "Kanye West",
+      "Tyler, the Creator",
+      "Travis Scott",
+      "Nicki Minaj",
+      "Doja Cat",
+      "Cardi B",
+      "Missy Elliott"
+    ]
+  },
+  {
+    "id": "p06",
+    "label": "Rock and Metal",
+    "artists": [
+      "Queen",
+      "The Beatles",
+      "Led Zeppelin",
+      "Pink Floyd",
+      "Nirvana",
+      "Radiohead",
+      "Metallica",
+      "Iron Maiden",
+      "Black Sabbath",
+      "Linkin Park",
+      "Foo Fighters",
+      "System of a Down",
+      "AC/DC",
+      "The Rolling Stones",
+      "Fleetwood Mac"
+    ]
+  },
+  {
+    "id": "p07",
+    "label": "Electronic and Lo-Fi",
+    "artists": [
+      "Daft Punk",
+      "Aphex Twin",
+      "Boards of Canada",
+      "Bonobo",
+      "Four Tet",
+      "Nujabes",
+      "J Dilla",
+      "Tycho",
+      "Burial",
+      "Massive Attack",
+      "The Chemical Brothers",
+      "deadmau5",
+      "ODESZA",
+      "Brian Eno",
+      "Moby"
+    ]
+  },
+  {
+    "id": "p08",
+    "label": "K-Pop",
+    "artists": [
+      "BTS",
+      "BLACKPINK",
+      "TWICE",
+      "EXO",
+      "Red Velvet",
+      "Seventeen",
+      "Stray Kids",
+      "NewJeans",
+      "IU",
+      "BIGBANG",
+      "Girls' Generation",
+      "SHINee",
+      "aespa",
+      "LE SSERAFIM",
+      "Tomorrow X Together"
+    ]
+  },
+  {
+    "id": "p09",
+    "label": "Jazz, Classical, and Ambient",
+    "artists": [
+      "Miles Davis",
+      "John Coltrane",
+      "Chet Baker",
+      "Ella Fitzgerald",
+      "Bill Evans",
+      "Nina Simone",
+      "Johann Sebastian Bach",
+      "Wolfgang Amadeus Mozart",
+      "Ludovico Einaudi",
+      "Max Richter",
+      "Ólafur Arnalds",
+      "Brian Eno",
+      "Erik Satie",
+      "Yiruma",
+      "Alice Coltrane"
+    ]
+  },
+  {
+    "id": "p10",
+    "label": "Country and Folk",
+    "artists": [
+      "Johnny Cash",
+      "Dolly Parton",
+      "Willie Nelson",
+      "Bob Dylan",
+      "Joni Mitchell",
+      "Neil Young",
+      "Kacey Musgraves",
+      "Chris Stapleton",
+      "Tyler Childers",
+      "Brandi Carlile",
+      "Zach Bryan",
+      "Joan Baez",
+      "Townes Van Zandt",
+      "John Denver",
+      "Emmylou Harris"
+    ]
+  }
+]

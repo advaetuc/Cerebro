@@ -6,4 +6,5 @@ __pycache__/
 venv/
 .env
 services/api/.env
+services/api/spike/.cache/
 services/api/spike/out/

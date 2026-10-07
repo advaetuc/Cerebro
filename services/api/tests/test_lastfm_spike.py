@@ -6,7 +6,13 @@ from collections import Counter
 import httpx
 
 from spike.lastfm_client import LastFmClient, LastFmResult, RateLimiter
-from spike.probe_lastfm import _items, build_report, clean_tags
+from spike.probe_lastfm import (
+    _build_vocabulary,
+    _items,
+    build_report,
+    clean_tags,
+    resolve_tags_with_fallback,
+)
 
 
 def test_tag_cleaning_filters_weak_self_and_junk_tags() -> None:
@@ -20,11 +26,13 @@ def test_tag_cleaning_filters_weak_self_and_junk_tags() -> None:
     assert clean_tags(tags, "Radiohead") == ["alternative rock"]
 
 
-def test_lastfm_error_in_http_200_is_returned_as_typed_result() -> None:
+def test_lastfm_error_in_http_200_is_returned_as_typed_result(tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"error": 29, "message": "Rate limit exceeded"})
 
-    client = LastFmClient("key", transport=httpx.MockTransport(handler), max_retries=0)
+    client = LastFmClient(
+        "key", transport=httpx.MockTransport(handler), max_retries=0, cache_dir=tmp_path
+    )
     try:
         result = client.user_get_info("private-user")
     finally:
@@ -105,14 +113,16 @@ def test_recent_track_count_skips_nowplaying_fixture() -> None:
     assert _items(result, ("recenttracks", "track")) == [{"name": "Scrobbled"}]
 
 
-def test_top_artist_period_uses_period_query_parameter() -> None:
+def test_top_artist_period_uses_period_query_parameter(tmp_path) -> None:
     observed: list[dict[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed.append(dict(request.url.params))
         return httpx.Response(200, json={"topartists": {"artist": []}})
 
-    client = LastFmClient("key", transport=httpx.MockTransport(handler), max_retries=0)
+    client = LastFmClient(
+        "key", transport=httpx.MockTransport(handler), max_retries=0, cache_dir=tmp_path
+    )
     try:
         result = client.user_top_artists("listener", "1month")
     finally:
@@ -125,3 +135,68 @@ def test_top_artist_period_uses_period_query_parameter() -> None:
 
 def _fixture_result(data: dict[str, object]) -> LastFmResult:
     return LastFmResult("fixture", 200, data)
+
+
+def test_fallback_borrows_only_when_direct_tags_are_below_three() -> None:
+    direct = [
+        {"name": "dream pop", "count": 40},
+        {"name": "indie", "count": 30},
+        {"name": "alternative", "count": 25},
+    ]
+    similar = [("Similar Artist", [{"name": "shoegaze", "count": 50}])]
+    direct_result, direct_borrowed = resolve_tags_with_fallback("Artist", direct, similar)
+    assert not direct_borrowed
+    assert "shoegaze" not in direct_result
+
+    fallback_result, fallback_borrowed = resolve_tags_with_fallback(
+        "Artist", direct[:2], similar
+    )
+    assert fallback_borrowed
+    assert "shoegaze" in fallback_result
+
+
+def test_borrowed_tag_weight_is_halved() -> None:
+    tags, borrowed = resolve_tags_with_fallback(
+        "Artist",
+        [{"name": "direct one", "count": 24}],
+        [("Similar Artist", [{"name": "borrowed mood", "count": 40}])],
+    )
+    assert borrowed
+    assert tags["borrowed mood"] == 20.0
+
+
+def test_singleton_tags_are_counted_but_excluded_from_vocabulary() -> None:
+    vocabulary, singleton_count = _build_vocabulary(
+        [
+            {"tags": {"shared": 10.0, "rare": 20.0}},
+            {"tags": {"shared": 5.0}},
+        ]
+    )
+    assert singleton_count == 1
+    assert vocabulary == [{"tag": "shared", "distinct_artist_count": 2, "weight": 15.0}]
+
+
+def test_cache_hit_makes_zero_additional_http_calls(tmp_path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"user": {"playcount": "12"}})
+
+    first_client = LastFmClient(
+        "key", transport=httpx.MockTransport(handler), max_retries=0, cache_dir=tmp_path
+    )
+    try:
+        first_result = first_client.user_get_info("listener")
+    finally:
+        first_client.close()
+    second_client = LastFmClient(
+        "key", transport=httpx.MockTransport(handler), max_retries=0, cache_dir=tmp_path
+    )
+    try:
+        second_result = second_client.user_get_info("listener")
+    finally:
+        second_client.close()
+    assert first_result.data == second_result.data
+    assert calls == 1

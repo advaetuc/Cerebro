@@ -49,6 +49,45 @@ def clean_tags(raw_tags: list[dict[str, Any]], artist_name: str) -> list[str]:
     return cleaned
 
 
+def resolve_tags_with_fallback(
+    artist_name: str,
+    raw_tags: list[dict[str, Any]],
+    similar_tag_sets: list[tuple[str, list[dict[str, Any]]]],
+) -> tuple[dict[str, float], bool]:
+    """Return cleaned tag weights and borrow only when direct coverage is low."""
+    direct_names = clean_tags(raw_tags, artist_name)
+    resolved: dict[str, float] = {}
+    seen: set[str] = set()
+    for tag in raw_tags:
+        name = str(tag.get("name", "")).strip()
+        key = name.casefold()
+        if name in direct_names and key not in seen:
+            resolved[name] = _tag_weight(tag)
+            seen.add(key)
+    if len(seen) >= 3:
+        return resolved, False
+    for similar_name, similar_tags in similar_tag_sets:
+        valid_names = clean_tags(similar_tags, similar_name)
+        for tag in similar_tags:
+            name = str(tag.get("name", "")).strip()
+            key = name.casefold()
+            if (
+                name in valid_names
+                and key != artist_name.casefold()
+                and key not in seen
+            ):
+                resolved[name] = _tag_weight(tag) * 0.5
+                seen.add(key)
+    return resolved, True
+
+
+def _tag_weight(tag: dict[str, Any]) -> float:
+    try:
+        return float(tag.get("count", tag.get("weight", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _items(result: LastFmResult, path: tuple[str, ...]) -> list[dict[str, Any]]:
     value: Any = result.data
     for key in path:
@@ -158,7 +197,7 @@ def build_report(
                 ),
                 "latency_ms": (
                     call.get("latency_ms")
-                    if isinstance(call.get("latency_ms"), (int, float))
+                    if isinstance(call.get("latency_ms"), int | float)
                     and not isinstance(call.get("latency_ms"), bool)
                     else 0
                 ),
@@ -187,6 +226,181 @@ def build_report(
             for tag, count in tag_counts.most_common(60)
         ],
     }
+
+
+def _profile_metrics(artists: list[dict[str, Any]]) -> dict[str, Any]:
+    checked = len(artists)
+    direct_usable = sum(artist["direct_tag_count"] >= 3 for artist in artists)
+    fallback_usable = sum(artist["cleaned_tag_count"] >= 3 for artist in artists)
+    return {
+        "direct_usable_pct": round(direct_usable / checked * 100, 2) if checked else 0.0,
+        "fallback_usable_pct": round(fallback_usable / checked * 100, 2) if checked else 0.0,
+        "artists_zero_tags_after_fallback": [
+            artist["name"] for artist in artists if artist["cleaned_tag_count"] == 0
+        ],
+        "median_cleaned_tags": (
+            statistics.median(artist["cleaned_tag_count"] for artist in artists)
+            if checked
+            else 0
+        ),
+    }
+
+
+def _build_vocabulary(
+    artists: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    tag_documents: Counter[str] = Counter()
+    tag_weights: Counter[str] = Counter()
+    display_names: dict[str, str] = {}
+    for artist in artists:
+        for tag, weight in artist["tags"].items():
+            key = tag.casefold()
+            tag_documents[key] += 1
+            tag_weights[key] += weight
+            display_names.setdefault(key, tag)
+    singleton_count = sum(count == 1 for count in tag_documents.values())
+    vocabulary = [
+        {
+            "tag": display_names[key],
+            "distinct_artist_count": count,
+            "weight": round(tag_weights[key], 2),
+        }
+        for key, count in sorted(
+            tag_documents.items(), key=lambda item: (-item[1], item[0])
+        )
+        if count > 1
+    ][:150]
+    return vocabulary, singleton_count
+
+
+def _response_items(result: LastFmResult, container: str, item: str) -> list[dict[str, Any]]:
+    return _items(result, (container, item))
+
+
+def _similar_artist_names(result: LastFmResult) -> list[str]:
+    return [
+        str(item.get("name", "")).strip()
+        for item in _response_items(result, "similarartists", "artist")
+        if item.get("name")
+    ]
+
+
+def _probe_fixture_artist(
+    artist_name: str,
+    client: LastFmClient,
+    calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    tags_result, row = _timed_call(
+        "artist.getTopTags", lambda: client.artist_top_tags(artist_name), ("toptags", "tag")
+    )
+    calls.append(row)
+    raw_tags = _tag_names(tags_result)
+    direct_tags = clean_tags(raw_tags, artist_name)
+    _, row = _timed_call(
+        "artist.getInfo", lambda: client.artist_get_info(artist_name), ("artist",)
+    )
+    calls.append(row)
+    similar_result, row = _timed_call(
+        "artist.getSimilar",
+        lambda: client.artist_similar(artist_name, limit=5),
+        ("similarartists", "artist"),
+    )
+    calls.append(row)
+    similar_names = _similar_artist_names(similar_result)[:5] if len(direct_tags) < 3 else []
+    similar_tag_sets: list[tuple[str, list[dict[str, Any]]]] = []
+    for similar_name in similar_names:
+        similar_result, row = _timed_call(
+            "artist.getTopTags",
+            lambda similar_name=similar_name: client.artist_top_tags(similar_name),
+            ("toptags", "tag"),
+        )
+        calls.append(row)
+        similar_tag_sets.append((similar_name, _tag_names(similar_result)))
+    resolved, borrowed = resolve_tags_with_fallback(
+        artist_name, raw_tags, similar_tag_sets
+    )
+    return {
+        "name": artist_name,
+        "direct_tag_count": len(direct_tags),
+        "cleaned_tag_count": len(resolved),
+        "borrowed": borrowed,
+        "tags": resolved,
+    }
+
+
+def _profile_report(profiles: list[dict[str, Any]], client: LastFmClient) -> dict[str, Any]:
+    calls: list[dict[str, Any]] = []
+    resolved_artists: dict[str, dict[str, Any]] = {}
+    profile_rows: list[dict[str, Any]] = []
+    for profile in profiles:
+        rows: list[dict[str, Any]] = []
+        for artist_name in profile["artists"]:
+            artist_key = artist_name.casefold()
+            if artist_key not in resolved_artists:
+                resolved_artists[artist_key] = _probe_fixture_artist(
+                    artist_name, client, calls
+                )
+            rows.append(resolved_artists[artist_key])
+        profile_rows.append(
+            {
+                "id": profile["id"],
+                "label": profile["label"],
+                **_profile_metrics(rows),
+                "artists": [
+                    {
+                        "name": row["name"],
+                        "direct_tag_count": row["direct_tag_count"],
+                        "cleaned_tag_count": row["cleaned_tag_count"],
+                        "borrowed": row["borrowed"],
+                    }
+                    for row in rows
+                ],
+            }
+        )
+
+    unique_artists = list(resolved_artists.values())
+    vocabulary, singleton_count = _build_vocabulary(unique_artists)
+    global_metrics = _profile_metrics(unique_artists)
+    return {
+        "profiles": profile_rows,
+        "global": global_metrics,
+        "vocabulary": vocabulary,
+        "singleton_tag_count": singleton_count,
+        "calls": calls,
+    }
+
+
+def run_profiles(path: Path, client: LastFmClient) -> dict[str, Any]:
+    """Probe profiles from a JSON fixture and write aggregate tag coverage."""
+    profiles = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(profiles, list):
+        raise ValueError("Profile fixture must be a JSON list")
+    for profile in profiles:
+        if (
+            not isinstance(profile, dict)
+            or not isinstance(profile.get("id"), str)
+            or not isinstance(profile.get("label"), str)
+            or not isinstance(profile.get("artists"), list)
+            or not all(isinstance(name, str) and name.strip() for name in profile["artists"])
+        ):
+            raise ValueError("Each profile must have an id, label, and artist name list")
+    report = _profile_report(profiles, client)
+    output_path = OUTPUT_PATH.parent / "fixtures_report.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print("profile | label | direct % | fallback % | median tags")
+    for profile in report["profiles"]:
+        print(
+            f"{profile['id']} | {profile['label']} | {profile['direct_usable_pct']} | "
+            f"{profile['fallback_usable_pct']} | {profile['median_cleaned_tags']}"
+        )
+    print(
+        json.dumps(
+            report["global"] | {"singleton_tag_count": report["singleton_tag_count"]},
+            indent=2,
+        )
+    )
+    return report
 
 
 def run_probe(username: str, client: LastFmClient) -> dict[str, Any]:
@@ -289,7 +503,9 @@ def run_probe(username: str, client: LastFmClient) -> dict[str, Any]:
 def main() -> int:
     """Run the command-line Last.fm endpoint probe."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--user", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--user")
+    source.add_argument("--profiles", type=Path)
     args = parser.parse_args()
     try:
         client = LastFmClient()
@@ -297,7 +513,10 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return 2
     try:
-        run_probe(args.user, client)
+        if args.profiles is not None:
+            run_profiles(args.profiles, client)
+        else:
+            run_probe(args.user, client)
     finally:
         client.close()
     return 0
