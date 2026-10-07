@@ -22,6 +22,7 @@ class LastFmResult:
     data: dict[str, Any]
     error_code: int | None = None
     error_message: str | None = None
+    query_param_names: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -71,16 +72,23 @@ class LastFmClient:
         self.client.close()
 
     def _call(self, method: str, **params: str | int) -> LastFmResult:
+        query_params = {"method": method, "api_key": self.api_key, "format": "json", **params}
         for attempt in range(self.max_retries + 1):
             self.limiter.wait()
             try:
                 response = self.client.get(
                     API_URL,
-                    params={"method": method, "api_key": self.api_key, "format": "json", **params},
+                    params=query_params,
                 )
             except httpx.HTTPError:
                 if attempt == self.max_retries:
-                    return LastFmResult(method, None, {}, error_message="HTTP request failed")
+                    return LastFmResult(
+                        method,
+                        None,
+                        {},
+                        error_message="HTTP request failed",
+                        query_param_names=tuple(query_params),
+                    )
                 time.sleep(min(2**attempt * 0.25, 4.0))
                 continue
             try:
@@ -107,8 +115,15 @@ class LastFmClient:
                 data=payload,
                 error_code=error_code if isinstance(error_code, int) else None,
                 error_message=str(payload.get("message", "")) or None,
+                query_param_names=tuple(query_params),
             )
-        return LastFmResult(method, None, {}, error_message="Request retry limit reached")
+        return LastFmResult(
+            method,
+            None,
+            {},
+            error_message="Request retry limit reached",
+            query_param_names=tuple(query_params),
+        )
 
     def user_get_info(self, username: str) -> LastFmResult:
         """Get public account information for a Last.fm username."""

@@ -52,10 +52,41 @@ def clean_tags(raw_tags: list[dict[str, Any]], artist_name: str) -> list[str]:
 def _items(result: LastFmResult, path: tuple[str, ...]) -> list[dict[str, Any]]:
     value: Any = result.data
     for key in path:
-        value = value.get(key, {}) if isinstance(value, dict) else {}
+        if not isinstance(value, dict) or key not in value:
+            return []
+        value = value[key]
     if isinstance(value, dict):
-        value = [value]
-    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+        value = [value] if value else []
+    if not isinstance(value, list):
+        return []
+    items = [item for item in value if isinstance(item, dict)]
+    if path == ("recenttracks", "track"):
+        items = [item for item in items if not _is_now_playing(item)]
+    return items
+
+
+def _is_now_playing(item: dict[str, Any]) -> bool:
+    marker = item.get("@attr", {})
+    return isinstance(marker, dict) and str(marker.get("nowplaying", "")).casefold() == "true"
+
+
+def _response_metadata(result: LastFmResult, path: tuple[str, ...]) -> dict[str, Any]:
+    container: Any = result.data
+    container_path = path if len(path) == 1 else path[:-1]
+    for key in container_path:
+        container = container.get(key, {}) if isinstance(container, dict) else {}
+    attrs = container.get("@attr", {}) if isinstance(container, dict) else {}
+    raw_total = attrs.get("total") if isinstance(attrs, dict) else None
+    try:
+        raw_total = int(raw_total) if raw_total is not None else None
+    except (TypeError, ValueError):
+        raw_total = None
+    return {
+        "response_keys": sorted(result.data),
+        "container_keys": sorted(container) if isinstance(container, dict) else [],
+        "raw_total": raw_total,
+        "query_param_names": list(result.query_param_names),
+    }
 
 
 def _record(
@@ -63,6 +94,7 @@ def _record(
     result: LastFmResult,
     item_count: int,
     latency_ms: float,
+    item_path: tuple[str, ...],
 ) -> dict[str, Any]:
     """Create a report row without names or response content."""
     return {
@@ -71,6 +103,7 @@ def _record(
         "error_code": result.error_code,
         "latency_ms": latency_ms,
         "item_count": item_count,
+        **_response_metadata(result, item_path),
     }
 
 
@@ -82,7 +115,7 @@ def _timed_call(
     started = time.perf_counter()
     result = call()
     latency = round((time.perf_counter() - started) * 1000, 2)
-    return result, _record(endpoint, result, len(_items(result, item_path)), latency)
+    return result, _record(endpoint, result, len(_items(result, item_path)), latency, item_path)
 
 
 def _artist_name(item: dict[str, Any]) -> str:
@@ -99,6 +132,7 @@ def build_report(
     cleaned_by_artist: list[list[str]],
     artists_with_listeners: int,
     tag_counts: Counter[str],
+    user_playcount: int | None = None,
 ) -> dict[str, Any]:
     """Build a report containing metrics and aggregate tags without identities."""
     checked = len(cleaned_by_artist)
@@ -110,18 +144,34 @@ def build_report(
                 "endpoint": (
                     call.get("endpoint") if call.get("endpoint") in ENDPOINTS else "unknown"
                 ),
-                "status": call.get("status") if type(call.get("status")) is int else None,
+                "status": (
+                    call.get("status")
+                    if isinstance(call.get("status"), int)
+                    and not isinstance(call.get("status"), bool)
+                    else None
+                ),
                 "error_code": (
-                    call.get("error_code") if type(call.get("error_code")) is int else None
+                    call.get("error_code")
+                    if isinstance(call.get("error_code"), int)
+                    and not isinstance(call.get("error_code"), bool)
+                    else None
                 ),
                 "latency_ms": (
                     call.get("latency_ms")
-                    if type(call.get("latency_ms")) in (int, float)
+                    if isinstance(call.get("latency_ms"), (int, float))
+                    and not isinstance(call.get("latency_ms"), bool)
                     else 0
                 ),
                 "item_count": (
-                    call.get("item_count") if type(call.get("item_count")) is int else 0
+                    call.get("item_count")
+                    if isinstance(call.get("item_count"), int)
+                    and not isinstance(call.get("item_count"), bool)
+                    else 0
                 ),
+                "response_keys": call.get("response_keys", []),
+                "container_keys": call.get("container_keys", []),
+                "raw_total": call.get("raw_total"),
+                "query_param_names": call.get("query_param_names", []),
             }
             for call in calls
         ],
@@ -131,6 +181,7 @@ def build_report(
         ),
         "artists_with_listeners_pct": listener_share,
         "artists_checked": checked,
+        "user_playcount": user_playcount,
         "aggregated_top_tags": [
             {"tag": tag, "count": count}
             for tag, count in tag_counts.most_common(60)
@@ -143,8 +194,20 @@ def run_probe(username: str, client: LastFmClient) -> dict[str, Any]:
     calls: list[dict[str, Any]] = []
     artist_names: list[str] = []
     seen_artists: set[str] = set()
-    _, row = _timed_call("user.getInfo", lambda: client.user_get_info(username), ("user",))
+    info_result, row = _timed_call(
+        "user.getInfo", lambda: client.user_get_info(username), ("user",)
+    )
     calls.append(row)
+    info = info_result.data.get("user", {})
+    try:
+        user_playcount = (
+            int(info["playcount"])
+            if isinstance(info, dict) and "playcount" in info
+            else None
+        )
+    except (TypeError, ValueError):
+        user_playcount = None
+    has_list_items = False
     for period in PERIODS:
         result, row = _timed_call(
             "user.getTopArtists",
@@ -152,25 +215,36 @@ def run_probe(username: str, client: LastFmClient) -> dict[str, Any]:
             ("topartists", "artist"),
         )
         calls.append(row)
-        for item in _items(result, ("topartists", "artist")):
+        artists = _items(result, ("topartists", "artist"))
+        has_list_items = has_list_items or bool(artists)
+        for item in artists:
             name = _artist_name(item).strip()
             key = name.casefold()
             if name and key not in seen_artists:
                 artist_names.append(name)
                 seen_artists.add(key)
     for period in PERIODS:
-        _, row = _timed_call(
+        result, row = _timed_call(
             "user.getTopTracks",
             lambda period=period: client.user_top_tracks(username, period),
             ("toptracks", "track"),
         )
         calls.append(row)
-    _, row = _timed_call(
+        has_list_items = has_list_items or bool(_items(result, ("toptracks", "track")))
+    result, row = _timed_call(
         "user.getRecentTracks",
         lambda: client.user_recent_tracks(username),
         ("recenttracks", "track"),
     )
     calls.append(row)
+    has_list_items = has_list_items or bool(_items(result, ("recenttracks", "track")))
+
+    if user_playcount == 0 or not has_list_items:
+        report = build_report(calls, [], 0, Counter(), user_playcount)
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print("No listening data for this user")
+        return report
 
     cleaned_by_artist: list[list[str]] = []
     tag_counts: Counter[str] = Counter()
@@ -197,7 +271,9 @@ def run_probe(username: str, client: LastFmClient) -> dict[str, Any]:
         if listeners not in (None, "", 0, "0"):
             artists_with_listeners += 1
 
-    report = build_report(calls, cleaned_by_artist, artists_with_listeners, tag_counts)
+    report = build_report(
+        calls, cleaned_by_artist, artists_with_listeners, tag_counts, user_playcount
+    )
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print("endpoint | status | error | items | ms")
