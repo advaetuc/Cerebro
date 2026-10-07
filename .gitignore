@@ -6,5 +6,4 @@ __pycache__/
 venv/
 .env
 services/api/.env
-services/api/.spotify_tokens.json
 services/api/spike/out/
