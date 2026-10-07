@@ -1,14 +1,12 @@
-endpoint | status | items | ms
-/me | 403 | 0 | 296.34
-/me/top/tracks | 403 | 0 | 147.03
-/me/top/tracks | 403 | 0 | 158.36
-/me/top/tracks | 403 | 0 | 148.62
-/me/top/artists | 403 | 0 | 153.82
-/me/top/artists | 403 | 0 | 153.49
-/me/top/artists | 403 | 0 | 153.87
-/me/player/recently-played | 403 | 0 | 153.39
-/audio-features/{top_track_id} | 0 | 0 | 0
-/audio-analysis/{top_track_id} | 0 | 0 | 0
-/recommendations | 0 | 0 | 0
-/search | 403 | 0 | 153.67
-Unique tracks gathered: 0
+(venv) PS C:\Users\Advaet\Documents\Projects\Cerebro\services\api> python -m spike.probe_catalog --cold
+archetype | movies | games | movie_ms cold/warm p50/max | game_ms cold/warm p50/max | total_ms cold/warm p50/max | top movies | top games
+Neon Insomniac | 27 | 138 | 150.78/258.02/- | 1264.98/1349.9/- | 1264.99/1349.91/- | Blade Runner, Dark City, The Thirteenth Floor, Looper, A Scanner Darkly | Resident Evil 5 Remastered, Mafia: Definitive Edition, Control: Ultimate Edition, Death Stranding: Director's Cut, Lara Croft and the Temple of Osiris
+Golden Hour Dreamer | 36 | 149 | 176.18/252.56/- | 1260.44/1295.17/- | 1260.45/1295.18/- | The Shawshank Redemption, The Godfather, Michael, 12 Angry Men, The Godfather Part II | Draugen, The Sims 4: City Living, Pokémon FireRed Version, Lara Croft and the Temple of Osiris, Ender Lilies: Quietus of the Knights
+Static Saint | 37 | 210 | 452.13/631.37/- | 1306.37/1326.64/- | 1306.38/1326.65/- | Drive My Car, Interstellar, Apollo 11, The Martian, Gattaca | Tetris Effect: Connected, Lovers in a Dangerous Spacetime, Deus Ex GO, Yu-Gi-Oh! Legacy of the Duelist:Link Evolution, Silent Hill 3
+Velvet Rebel | 24 | 141 | 243.0/290.74/- | 1370.44/2595.26/- | 1370.45/2595.27/- | Taxi Driver, Joker, Nightcrawler, The Irishman, American Psycho | Death Stranding: Director's Cut, Rise of the Tomb Raider: 20 Year Celebration, Assassin's Creed Valhalla, Eldritch, EverQuest
+Solar Sprinter | 20 | 107 | 151.23/280.75/- | 1259.68/1266.57/- | 1259.69/1266.58/- | Everything Everywhere All at Once, Red One, The Fall Guy, The Killer's Game, The Naked Gun | Sonic Generations, Human: Fall Flat, Jackie Chan: Stuntmaster, Ender Lilies: Quietus of the Knights, Sonic Frontiers
+Hollow Wanderer | 3 | 211 | 140.58/241.9/- | 1062.77/4215.76/- | 1062.78/4215.77/- | A Quiet Place, A Quiet Place Part II, A Quiet Place: Day One | Resident Evil 5 Remastered, Death Stranding: Director's Cut, Rise of the Tomb Raider: 20 Year Celebration, Alien: Isolation, Alan Wake II
+Chrome Romantic | 40 | 27 | 136.69/255.35/- | 1064.16/1301.69/- | 1064.17/1301.7/- | Dilwale Dulhania Le Jayenge, Parasite, Pulp Fiction, Forrest Gump, Life Is Beautiful | Gitaroo Man, Golf Club Nostalgia, Patapon, Muse Dash, Pid
+Echo Archivist | 0 | 173 | 463.94/477.21/- | 1269.95/1271.81/- | 1269.96/1271.82/- |  | Conflict: Desert Storm II: Back to Baghdad, Banished, Front Mission, Praetorians, North & South
+connect+TLS | TMDB {'tcp_ms': 134.21, 'tls_ms': 126.96, 'connect_tls_ms': 261.17} | IGDB {'tcp_ms': 18.66, 'tls_ms': 9.06, 'connect_tls_ms': 27.73}
+(venv) PS C:\Users\Advaet\Documents\Projects\Cerebro\services\api> 
