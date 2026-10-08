@@ -41,7 +41,7 @@ class FakeLastFm:
 
 
 class FakeRanker:
-    async def rank(self, vector, primary, secondary):
+    async def rank(self, vector, primary, secondary, *, top_families=None):
         return {
             "movies": [
                 {
@@ -123,3 +123,49 @@ def test_config_error_returns_503_with_clear_message() -> None:
     app.dependency_overrides.clear()
     assert response.status_code == 503
     assert "re-copy the full token" in response.json()["detail"]
+
+
+def test_catalog_failures_return_partial_results_without_502() -> None:
+    class PartialRanker(FakeRanker):
+        async def rank(self, vector, primary, secondary, *, top_families=None):
+            return {
+                "movies": [], "games": [{"id": "g1", "title": "Game"}],
+                "degraded": True,
+                "degraded_reasons": ["movies unavailable"],
+            }
+
+    app.dependency_overrides[get_lastfm_client] = lambda: FakeLastFm()
+    app.dependency_overrides[get_ranking_service] = lambda: PartialRanker()
+    with TestClient(app) as client:
+        response = client.post(
+            "/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]}
+        )
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.json()["movies"] == []
+    assert response.json()["games"][0]["id"] == "g1"
+    assert response.json()["degraded"] is True
+
+
+def test_both_catalog_failures_return_provider_and_reason(caplog) -> None:
+    class FailedRanker(FakeRanker):
+        async def rank(self, vector, primary, secondary, *, top_families=None):
+            return {
+                "movies": [], "games": [], "degraded": True,
+                "upstream_error": True,
+                "failed_providers": ["TMDB", "IGDB"],
+            }
+
+    app.dependency_overrides[get_lastfm_client] = lambda: FakeLastFm()
+    app.dependency_overrides[get_ranking_service] = lambda: FailedRanker()
+    with TestClient(app) as client:
+        response = client.post(
+            "/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]}
+        )
+    app.dependency_overrides.clear()
+    assert response.status_code == 502
+    assert response.json() == {
+        "provider": "TMDB/IGDB", "reason": "Catalog results are unavailable."
+    }
+    assert "provider=TMDB/IGDB" in caplog.text
+    assert "endpoint=catalog retrieval" in caplog.text

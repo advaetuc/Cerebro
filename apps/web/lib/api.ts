@@ -8,6 +8,7 @@ export type Pick = {
   match_pct: number;
   why: string;
   source_url: string;
+  regional?: boolean;
 };
 export type VibeResult = {
   vector: Record<string, number>;

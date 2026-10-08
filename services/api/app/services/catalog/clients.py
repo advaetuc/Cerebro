@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -33,6 +34,24 @@ def clean_env_value(name: str, value: str | None = None) -> str:
     """Read an environment value after removing common copy/paste wrappers."""
     raw = os.getenv(name, "") if value is None else value
     return raw.strip().strip("\ufeff").strip().strip("\"'").strip()
+
+
+def redact_secrets(message: str) -> str:
+    """Remove configured credentials from upstream error messages."""
+    cleaned = str(message)
+    for name in (
+        "LASTFM_API_KEY", "TMDB_READ_TOKEN", "TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET"
+    ):
+        secret = clean_env_value(name)
+        if len(secret) >= 4:
+            cleaned = cleaned.replace(secret, "[redacted]")
+    cleaned = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", cleaned)
+    cleaned = re.sub(
+        r"(?i)(api_key|access_token|client_secret|token)=\S+",
+        r"\1=[redacted]",
+        cleaned,
+    )
+    return cleaned.replace("\n", " ")
 
 
 
@@ -197,11 +216,22 @@ class JsonDiskCache:
 
     def get(self, key: str) -> Any | None:
         """Return an unexpired cached value, if present."""
+        payload = self._read_entry(key)
+        if payload is None:
+            return None
+        if time.time() - float(payload["saved_at"]) > self.ttl:
+            return None
+        return payload["value"]
+
+    def get_stale(self, key: str) -> Any | None:
+        """Return cached data even when its normal TTL has expired."""
+        payload = self._read_entry(key)
+        return payload.get("value") if payload else None
+
+    def _read_entry(self, key: str) -> dict[str, Any] | None:
         try:
-            payload = json.loads(self._path(key).read_text(encoding="utf-8"))
-            if time.time() - float(payload["saved_at"]) > self.ttl:
-                return None
-            return payload["value"]
+            value = json.loads(self._path(key).read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else None
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
@@ -263,7 +293,7 @@ class CatalogClients:
         cache: JsonDiskCache | None = None,
         limiter: AsyncRateLimiter | None = None,
         igdb_bucket: AsyncTokenBucket | None = None,
-        tmdb_concurrency: int = 4,
+        tmdb_concurrency: int = 2,
         igdb_concurrency: int = 8,
         token_path: Path | None = None,
     ) -> None:
@@ -272,7 +302,14 @@ class CatalogClients:
         self.tmdb_token = clean_env_value("TMDB_READ_TOKEN", tmdb_token)
         self.client_id = clean_env_value("TWITCH_CLIENT_ID", twitch_client_id)
         self.client_secret = clean_env_value("TWITCH_CLIENT_SECRET", twitch_client_secret)
-        self.client = client or httpx.AsyncClient(timeout=20.0)
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30.0,
+            ),
+        )
         self._owns_client = client is None
         self.cache = cache or JsonDiskCache()
         self.limiter = limiter or AsyncRateLimiter(4.0)

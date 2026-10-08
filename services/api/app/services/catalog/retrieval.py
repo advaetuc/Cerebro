@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import statistics
 import time
 from pathlib import Path
@@ -13,14 +14,17 @@ from typing import Any
 from .clients import (
     CatalogClients,
     CatalogResult,
+    ConfigError,
     build_apicalypse,
     build_multiquery,
     build_tmdb_params,
+    redact_secrets,
 )
 
 SPIKE_DIR = Path(__file__).resolve().parents[3] / "spike"
 BLUEPRINT_PATH = SPIKE_DIR.parents[2] / "docs" / "cerebro_blueprint.md"
 REPORT_PATH = SPIKE_DIR / "out" / "catalog_report.json"
+logger = logging.getLogger("cerebro.upstream")
 
 INTENTS: dict[str, dict[str, Any]] = {
     "Neon Insomniac": {
@@ -75,6 +79,15 @@ INTENTS: dict[str, dict[str, Any]] = {
     },
 }
 
+KEYWORD_SYNONYMS = {
+    "coming of age": ("coming-of-age", "teenager"),
+    "road movie": ("road trip",),
+    "retro futurism": ("retrofuturism", "retro-futuristic"),
+    "rhythm": ("music", "dance"),
+    "survival": ("survival horror", "wilderness"),
+    "romance": ("love", "romantic comedy"),
+}
+
 
 def _items(result: CatalogResult, key: str | None = None) -> list[dict[str, Any]]:
     payload = result.data
@@ -99,27 +112,76 @@ async def _prepare(clients: CatalogClients) -> dict[str, Any]:
         {name for intent in INTENTS.values() for name in intent["tmdb_keywords"]}
     )
     tmdb_genres, igdb_genres, igdb_themes, *keywords = await asyncio.gather(
-        clients.tmdb_genres(),
-        clients.igdb_genres(),
-        clients.igdb_themes(),
-        *(clients.tmdb_keyword(name) for name in keyword_names),
+        _safe_catalog_call(clients.tmdb_genres(), "genre/movie/list"),
+        _safe_catalog_call(clients.igdb_genres(), "genres"),
+        _safe_catalog_call(clients.igdb_themes(), "themes"),
+        *(_resolve_keyword(clients, name) for name in keyword_names),
     )
     keyword_results = dict(zip(keyword_names, keywords, strict=True))
+    unresolved = {
+        name: _keyword_failure(result)
+        for name, result in keyword_results.items()
+        if not result.ok
+    }
     return {
-        "tmdb_genres": _name_ids(_items(tmdb_genres, "genres")),
+        "tmdb_genres": _name_ids(_items(tmdb_genres, "genres")) if tmdb_genres.ok else {},
         "tmdb_keywords": {
             name.casefold(): (
                 int(_items(result, "results")[0]["id"])
-                if _items(result, "results") and _items(result, "results")[0].get("id") is not None
+                if result.ok and _items(result, "results")
+                and _items(result, "results")[0].get("id") is not None
                 else None
             )
             for name, result in keyword_results.items()
         },
         "keyword_results": {name.casefold(): result for name, result in keyword_results.items()},
-        "igdb_genres": _name_ids(_items(igdb_genres)),
-        "igdb_themes": _name_ids(_items(igdb_themes)),
+        "unresolved_keywords": unresolved,
+        "tmdb_genres_ok": tmdb_genres.ok,
+        "igdb_available": (igdb_genres.ok or igdb_themes.ok),
+        "igdb_genres": _name_ids(_items(igdb_genres)) if igdb_genres.ok else {},
+        "igdb_themes": _name_ids(_items(igdb_themes)) if igdb_themes.ok else {},
         "boot_results": [tmdb_genres, igdb_genres, igdb_themes, *keywords],
     }
+
+
+async def _safe_catalog_call(awaitable: Any, endpoint: str) -> CatalogResult:
+    try:
+        return await awaitable
+    except ConfigError:
+        raise
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:120]}"
+        return CatalogResult(endpoint, None, None, "transport_error", str(exc)[:120], detail)
+
+
+async def _resolve_keyword(clients: CatalogClients, name: str) -> CatalogResult:
+    aliases = (name, *KEYWORD_SYNONYMS.get(name.casefold(), ()))
+    last_result = CatalogResult(f"search/keyword:{name}", "no_match", {"results": []})
+    for alias in aliases:
+        result = await _safe_catalog_call(clients.tmdb_keyword(alias), f"search/keyword:{alias}")
+        if result.ok:
+            return result
+        detail = result.error_detail or result.error_message or f"HTTP {result.status}"
+        detail = redact_secrets(detail)
+        error_class = "KeywordNoMatch" if result.status == "no_match" else detail.split(":", 1)[0]
+        message = detail.split(":", 1)[-1].strip()[:120]
+        logger.warning(
+            "upstream failure provider=TMDB endpoint=%s exception=%s message=%s",
+            result.endpoint,
+            error_class[:60],
+            message,
+        )
+        last_result = result
+        if result.status != "no_match":
+            continue
+    return last_result
+
+
+def _keyword_failure(result: CatalogResult) -> str:
+    if result.status == "no_match":
+        return "no_match"
+    detail = result.error_detail or result.error_message or "upstream_error"
+    return detail.split(":", 1)[0][:40]
 
 
 def _tmdb_ids(intent: dict[str, Any], ids: dict[str, Any]) -> tuple[list[int], list[int]]:
@@ -201,10 +263,9 @@ async def _fetch_intent(
         rung_used = rung
         if len(selected_items) >= 60:
             break
-    unresolved = [
-        name for name in intent["tmdb_keywords"]
-        if ids["tmdb_keywords"].get(name.casefold()) is None
-    ]
+    unresolved = [name for name in intent["tmdb_keywords"]
+                  if ids["tmdb_keywords"].get(name.casefold()) is None]
+    keyword_errors = ids.get("unresolved_keywords", {})
     degraded = (
         rung_used != "a"
         or len(selected_items) < 60
@@ -216,6 +277,7 @@ async def _fetch_intent(
         "calls": all_calls,
         "rung_used": rung_used,
         "unresolved_keywords": unresolved,
+        "keyword_errors": {name: keyword_errors.get(name, "no_match") for name in unresolved},
         "degraded": degraded,
         "movie_ms": (time.perf_counter() - started) * 1000,
     }

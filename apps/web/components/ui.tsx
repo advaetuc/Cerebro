@@ -24,8 +24,8 @@ export function NeonBorder({ children, className = "" }: { children: React.React
 export function SignalMeter({ value }: { value: number }) {
   const segments = 20;
   return <div className="signal-wrap">
-    <div className="signal-heading"><span>Signal strength</span><strong>{Math.round(value)}%</strong></div>
-    <div className="signal-meter" role="meter" aria-label="Signal strength" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(value)}>
+    <div className="signal-heading"><span>Taste confidence</span><strong>{Math.round(value)}%</strong></div>
+    <div className="signal-meter" role="meter" aria-label="Taste confidence" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(value)}>
       {Array.from({ length: segments }, (_, index) => <i key={index} className={index < Math.round(value / 5) ? "on" : ""} />)}
     </div>
   </div>;
@@ -55,7 +55,8 @@ export function PosterCard({ pick, kind }: { pick: Pick; kind: "movie" | "game" 
     <a href={pick.source_url} target="_blank" rel="noreferrer" className="poster-link" aria-label={`${pick.title}${pick.year ? `, ${pick.year}` : ""}`}>
       <div className="poster-image">
         {pick.image_url && !failed ? <img src={pick.image_url} alt={`${pick.title} ${kind} artwork`} loading="lazy" onError={() => setFailed(true)} /> : <div className="poster-fallback" aria-hidden="true"><span>{kind === "movie" ? "FILM" : "GAME"}</span></div>}
-        <span className="match-badge">{pick.match_pct ?? Math.max(60, Math.min(98, Math.round(60 + (pick.score - 0.35) * 95)))}% match</span>
+        {pick.regional && <span className="regional-badge">Regional</span>}
+        <span className="match-badge">{pick.match_pct}% match</span>
       </div>
       <div className="poster-copy"><h3>{pick.title}</h3><span className="poster-year">{pick.year || "A new discovery"}</span><p>{pick.why}</p></div>
     </a>

@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import json
 
 import httpx
 
@@ -16,6 +17,7 @@ from app.services.catalog.clients import (
     build_headers,
     build_multiquery,
     build_tmdb_params,
+    redact_secrets,
     select_keyword_match,
     tmdb_backoff_delay,
     token_is_valid,
@@ -94,6 +96,16 @@ def test_header_helper_cleans_wrappers_and_rejects_non_ascii() -> None:
         assert "re-copy the full token" in str(error)
     else:
         raise AssertionError("non-ASCII header value should be rejected")
+
+
+def test_upstream_error_redaction_hides_configured_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("TMDB_READ_TOKEN", "tmdb-secret-value")
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "twitch-secret-value")
+    message = "Bearer tmdb-secret-value?token=twitch-secret-value"
+    cleaned = redact_secrets(message)
+    assert "tmdb-secret-value" not in cleaned
+    assert "twitch-secret-value" not in cleaned
+    assert "[redacted]" in cleaned
 
 
 def test_async_limiter_spaces_requests(monkeypatch) -> None:
@@ -265,7 +277,7 @@ def test_tmdb_semaphore_bounds_concurrent_calls(tmp_path) -> None:
 
     fake = SlowClient()
     clients = CatalogClients(
-        tmdb_token="token", client=fake, tmdb_concurrency=4,
+        tmdb_token="token", client=fake,
         token_path=tmp_path / "token",
     )
 
@@ -276,7 +288,26 @@ def test_tmdb_semaphore_bounds_concurrent_calls(tmp_path) -> None:
         ))
 
     asyncio.run(exercise())
-    assert fake.maximum == 4
+    assert fake.maximum == 2
+
+
+def test_catalog_client_uses_connect_read_timeouts_and_keepalive_pool() -> None:
+    clients = CatalogClients(tmdb_token="token", twitch_client_id="client")
+    assert clients.client.timeout.connect == 10
+    assert clients.client.timeout.read == 20
+    assert clients.client._transport._pool._max_keepalive_connections > 0
+    asyncio.run(clients.close())
+
+
+def test_id_cache_exposes_expired_pool_as_stale(tmp_path) -> None:
+    cache = JsonDiskCache(tmp_path, ttl=60)
+    cache.set("pool:test", {"movies": [{"id": 1}]})
+    path = cache._path("pool:test")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["saved_at"] = 0
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert cache.get("pool:test") is None
+    assert cache.get_stale("pool:test") == {"movies": [{"id": 1}]}
 
 
 def test_keyword_match_prefers_exact_then_highest_rank() -> None:

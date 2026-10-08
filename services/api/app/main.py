@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from typing import Any
@@ -17,14 +18,15 @@ from pydantic import BaseModel
 from app.services.catalog.clients import (
     CatalogClients,
     ConfigError,
-    build_headers,
     clean_env_value,
+    redact_secrets,
 )
 from app.services.ranking import RankingService
 from app.services.vibe import ArtistInput, VibeResolver
 from spike.lastfm_client import LastFmClient, LastFmResult
 
 ANALYZE_CACHE_SECONDS = 15 * 60
+logger = logging.getLogger("cerebro.upstream")
 ATTRIBUTION = [
     "Data provided by Last.fm",
     "This product uses the TMDB API but is not endorsed or certified by TMDB.",
@@ -55,6 +57,29 @@ class AnalyzeRequest(BaseModel):
 class UpstreamError(RuntimeError):
     """Represent an unsuccessful upstream service response."""
 
+    def __init__(
+        self, provider: str, endpoint: str, reason: str, exception_class: str = "UpstreamError"
+    ) -> None:
+        self.provider = provider
+        self.endpoint = endpoint
+        self.reason = _safe_reason(reason)
+        self.exception_class = exception_class
+        super().__init__(self.reason)
+
+
+def _safe_reason(value: str) -> str:
+    return redact_secrets(value)[:160]
+
+
+def _log_upstream_failure(provider: str, endpoint: str, exception: str, message: str) -> None:
+    logger.warning(
+        "upstream failure provider=%s endpoint=%s exception=%s message=%s",
+        provider,
+        endpoint,
+        exception[:60],
+        _safe_reason(message)[:120],
+    )
+
 
 @app.on_event("startup")
 async def startup() -> None:
@@ -65,18 +90,8 @@ async def startup() -> None:
     app.state.lastfm = None
     app.state.catalog = None
     app.state.ranker = None
-    try:
-        tmdb_token = clean_env_value("TMDB_READ_TOKEN")
-        client_id = clean_env_value("TWITCH_CLIENT_ID")
-        if tmdb_token:
-            build_headers({"Authorization": ("TMDB_READ_TOKEN", f"Bearer {tmdb_token}")})
-        if client_id:
-            build_headers({"Client-ID": ("TWITCH_CLIENT_ID", client_id)})
-        app.state.catalog = CatalogClients()
-        app.state.ranker = RankingService(app.state.catalog)
-    except ConfigError as exc:
-        app.state.config_error = str(exc)
-        print(str(exc), file=sys.stderr)
+    app.state.catalog = CatalogClients()
+    app.state.ranker = RankingService(app.state.catalog)
     if clean_env_value("LASTFM_API_KEY"):
         try:
             app.state.lastfm = LastFmClient()
@@ -103,12 +118,19 @@ async def config_error_handler(request: Request, exc: ConfigError) -> JSONRespon
 
 @app.exception_handler(UpstreamError)
 async def upstream_error_handler(request: Request, exc: UpstreamError) -> JSONResponse:
-    return JSONResponse(status_code=502, content={"detail": str(exc)})
+    _log_upstream_failure(exc.provider, exc.endpoint, exc.exception_class, exc.reason)
+    return JSONResponse(
+        status_code=502,
+        content={"provider": exc.provider, "reason": exc.reason},
+    )
 
 
 @app.exception_handler(httpx.HTTPError)
 async def http_error_handler(request: Request, exc: httpx.HTTPError) -> JSONResponse:
-    return JSONResponse(status_code=502, content={"detail": "An upstream service request failed."})
+    _log_upstream_failure("upstream", "unknown", type(exc).__name__, str(exc))
+    return JSONResponse(status_code=502, content={
+        "provider": "upstream", "reason": "An upstream service request failed."
+    })
 
 
 def get_lastfm_client(request: Request) -> LastFmClient:
@@ -149,7 +171,11 @@ def _items(result: LastFmResult, *path: str) -> list[dict[str, Any]]:
 
 def _require_success(result: LastFmResult) -> None:
     if not result.ok:
-        raise UpstreamError("Last.fm could not complete the request.")
+        exception = "TransportError" if result.status is None else (
+            "HTTPStatusError" if result.status >= 400 else "LastFmAPIError"
+        )
+        reason = result.error_message or f"HTTP {result.status}"
+        raise UpstreamError("Last.fm", result.endpoint, reason, exception)
 
 
 def _clean_artist_tags(raw: list[dict[str, Any]], artist_name: str) -> list[dict[str, Any]]:
@@ -177,9 +203,19 @@ def _artist_payload(result: LastFmResult) -> dict[str, Any]:
     return artist if isinstance(artist, dict) else {}
 
 
+def _log_lastfm_result_failure(result: LastFmResult) -> None:
+    exception = "TransportError" if result.status is None else (
+        "HTTPStatusError" if result.status >= 400 else "LastFmAPIError"
+    )
+    _log_upstream_failure(
+        "Last.fm", result.endpoint, exception,
+        result.error_message or f"HTTP {result.status}",
+    )
+
+
 def _tag_payload(result: LastFmResult) -> list[dict[str, Any]]:
     if not result.ok:
-        raise UpstreamError("Last.fm could not load artist tags.")
+        _require_success(result)
     return _items(result, "toptags", "tag")
 
 
@@ -212,6 +248,8 @@ def _resolve_artist(
     tags = direct
     if len(direct) < 3:
         similar_result = client.artist_similar(name, limit=5)
+        if not similar_result.ok:
+            _log_lastfm_result_failure(similar_result)
         similar = _items(similar_result, "similarartists", "artist") if similar_result.ok else []
         known = {tag["name"].casefold() for tag in tags}
         for similar_artist in similar[:5]:
@@ -229,6 +267,8 @@ def _resolve_artist(
                     known.add(key)
         borrowed = bool(tags and len(direct) < 3)
     info_result = client.artist_get_info(name)
+    if not info_result.ok:
+        _log_lastfm_result_failure(info_result)
     info = _artist_payload(info_result) if info_result.ok else {}
     stats = info.get("stats", {})
     try:
@@ -283,7 +323,9 @@ async def search_artists(
     except UpstreamError:
         raise
     except Exception as exc:
-        raise UpstreamError("Last.fm artist search failed.") from exc
+        raise UpstreamError(
+            "Last.fm", "artist.search", str(exc), type(exc).__name__
+        ) from exc
 
 
 def _analyze_key(payload: AnalyzeRequest) -> str:
@@ -333,10 +375,12 @@ async def analyze(
         vibe = VibeResolver().resolve_profile(artist_inputs)
         signal_pct = vibe["signal_strength_pct"] * (0.7 if payload.mode == "seed" else 1)
         ranked = await ranker.rank(
-            vibe["vector"], vibe["primary"], vibe["secondary"]
+            vibe["vector"], vibe["primary"], vibe["secondary"],
+            top_families=vibe["top_families"],
         )
         if ranked.get("upstream_error"):
-            raise UpstreamError("Catalog providers could not complete the request.")
+            provider = "/".join(ranked.get("failed_providers", ["TMDB/IGDB"]))
+            raise UpstreamError(provider, "catalog retrieval", "Catalog results are unavailable.")
         response = {
             "vector": vibe["vector"],
             "signal_pct": round(signal_pct, 2),
@@ -360,6 +404,8 @@ async def analyze(
     except UpstreamError:
         raise
     except httpx.HTTPError as exc:
-        raise UpstreamError("An upstream service request failed.") from exc
+        raise UpstreamError(
+            "upstream", "analyze", "An upstream service request failed.", type(exc).__name__
+        ) from exc
     except Exception as exc:
-        raise UpstreamError("The analysis could not be completed.") from exc
+        raise HTTPException(status_code=500, detail="The analysis could not be completed.") from exc
