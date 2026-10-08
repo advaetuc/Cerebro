@@ -46,7 +46,8 @@ class FakeRanker:
             "movies": [
                 {
                     "id": str(index), "title": f"Movie {index}", "year": "2020",
-                    "image_url": None, "score": 0.8, "why": "Matches your taste.",
+                    "image_url": None, "score": 0.8, "match_pct": 90,
+                    "why": "Matches your taste.",
                     "source_url": "https://example.test/movie",
                 }
                 for index in range(10)
@@ -54,7 +55,8 @@ class FakeRanker:
             "games": [
                 {
                     "id": str(index), "title": f"Game {index}", "year": "2020",
-                    "image_url": None, "score": 0.8, "why": "Matches your taste.",
+                    "image_url": None, "score": 0.8, "match_pct": 90,
+                    "why": "Matches your taste.",
                     "source_url": "https://example.test/game",
                 }
                 for index in range(10)
@@ -83,8 +85,10 @@ def test_seed_analyze_returns_response_shape() -> None:
     }
     assert len(data["movies"]) == 10
     assert len(data["games"]) == 10
+    assert all("match_pct" in pick for pick in data["movies"] + data["games"])
     assert data["signal_pct"] >= 0
     assert "attribution" in data
+    assert "degraded_reasons" in data
 
 
 def test_lastfm_analyze_returns_response_shape() -> None:

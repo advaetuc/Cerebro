@@ -9,3 +9,9 @@ services/api/.env
 services/api/spike/.cache/
 services/api/spike/.cache/catalog/
 services/api/spike/out/
+node_modules/
+apps/web/.next/
+apps/web/out/
+apps/web/.env.local
+apps/web/.vercel/
+apps/web/tsconfig.tsbuildinfo

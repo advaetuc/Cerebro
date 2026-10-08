@@ -111,11 +111,6 @@ async def http_error_handler(request: Request, exc: httpx.HTTPError) -> JSONResp
     return JSONResponse(status_code=502, content={"detail": "An upstream service request failed."})
 
 
-# @app.exception_handler(Exception)
-# async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
-#     return JSONResponse(status_code=502, content={"detail": "The request could not be completed."})
-
-
 def get_lastfm_client(request: Request) -> LastFmClient:
     """Return the shared Last.fm client or raise its saved config error."""
     message = getattr(request.app.state, "config_error", None)
@@ -353,6 +348,8 @@ async def analyze(
             "games": ranked["games"][:10],
             "attribution": ATTRIBUTION,
             "degraded": bool(ranked["degraded"] or signal_pct < 30),
+            "degraded_reasons": list(ranked.get("degraded_reasons", []))
+            + (["Listening signal is limited."] if signal_pct < 30 else []),
         }
         cache[key] = (time.time() + ANALYZE_CACHE_SECONDS, response)
         return response
@@ -365,7 +362,4 @@ async def analyze(
     except httpx.HTTPError as exc:
         raise UpstreamError("An upstream service request failed.") from exc
     except Exception as exc:
-        # raise UpstreamError("The analysis could not be completed.") from exc
-        import traceback
-        traceback.print_exc() # Forces the real stack trace to print to your Uvicorn window!
-        raise HTTPException(status_code=500, detail=f"Debug Error: {type(exc).__name__} - {str(exc)}")
+        raise UpstreamError("The analysis could not be completed.") from exc

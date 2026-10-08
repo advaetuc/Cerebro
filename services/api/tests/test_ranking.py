@@ -73,6 +73,9 @@ def test_ranking_returns_ten_and_diversifies_genres(tmp_path) -> None:
     assert len(results["movies"]) == 10
     assert len(results["games"]) == 10
     assert len({item["id"] for item in results["movies"]}) == 10
+    assert all(60 <= item["match_pct"] <= 98 for item in results["movies"])
+    assert all(item["why"].endswith(".") for item in results["movies"])
+    assert all("late-night, driving" not in item["why"] for item in results["movies"])
     assert results["games"][0]["image_url"].startswith(
         "https://images.igdb.com/igdb/image/upload/t_cover_big/"
     )

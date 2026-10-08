@@ -53,7 +53,8 @@ def test_intent_names_resolve_to_runtime_query_ids() -> None:
     assert len(movie_queries) == 2
     assert len(game_queries) == 3
     assert all("with_genres" in query and "with_keywords" in query for query in movie_queries)
-    assert all("total_rating_count >= 50" in query for query in game_queries)
+    assert all("total_rating_count >= 100" in query for query in game_queries)
+    assert all("total_rating >= 65" in query for query in game_queries)
 
 
 def test_tmdb_query_builder_uses_resolved_ids_and_vote_floor() -> None:
@@ -71,7 +72,7 @@ def test_apicalypse_body_is_stable() -> None:
     assert build_apicalypse([12], [31]) == (
         "fields id,name,first_release_date,total_rating,total_rating_count,genres,themes,"
         "cover.image_id; "
-        "where total_rating_count >= 50 & genres = (12) & themes = (31); "
+        "where total_rating_count >= 100 & total_rating >= 65 & genres = (12) & themes = (31); "
         "sort total_rating desc; limit 40;"
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import time
 from pathlib import Path
@@ -79,26 +80,22 @@ IGDB_GENRE_CENTROIDS = {
 IGDB_THEME_CENTROIDS = {
     theme: FAMILY_BY_ID[family].dims for theme, family in IGDB_THEME_FAMILIES.items()
 }
-MOOD_PHRASES = {
-    "Neon Insomniac": "late-night, driving",
-    "Golden Hour Dreamer": "warm, reflective",
-    "Static Saint": "quiet, immersive",
-    "Velvet Rebel": "moody, offbeat",
-    "Solar Sprinter": "bright, high-energy",
-    "Hollow Wanderer": "spacious, introspective",
-    "Chrome Romantic": "bright, romantic",
-    "Echo Archivist": "thoughtful, timeless",
+DIM_PHRASES = {
+    "energy": ("slow-burning", "high-energy"),
+    "valence": ("moody", "uplifting"),
+    "acousticness": ("electrically textured", "warm and acoustic"),
+    "danceability": ("made for listening in", "built to move to"),
+    "instrumentalness": ("vocal-led", "instrumental"),
+    "tempo": ("unhurried", "fast-paced"),
+    "era": ("classic", "modern"),
+    "mainstream": ("off the beaten path", "widely loved"),
 }
-DIM_LABELS = {
-    "energy": "energy",
-    "valence": "valence",
-    "acousticness": "acousticness",
-    "danceability": "danceability",
-    "instrumentalness": "instrumentalness",
-    "tempo": "tempo",
-    "era": "era",
-    "mainstream": "mainstream",
-}
+WHY_TEMPLATES = (
+    "Its {phrases} qualities line up with your listening profile.",
+    "You may connect with its {phrases} feel.",
+    "This pick reflects your taste for {phrases} sounds.",
+    "Your profile points toward its {phrases} character.",
+)
 
 
 def _cosine(left: dict[str, float], right: dict[str, float]) -> float:
@@ -196,13 +193,25 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(union) if union else 0.0
 
 
-def _explanation(user: dict[str, float], title: dict[str, float], archetype: str) -> str:
-    closest = sorted(DIMENSIONS, key=lambda dim: abs(user[dim] - title[dim]))[:2]
+def _explanation(user: dict[str, float], title: dict[str, float], title_id: str) -> str:
+    user_z = _standardize(tuple(user[dim] for dim in DIMENSIONS))
+    title_z = _standardize(tuple(title[dim] for dim in DIMENSIONS))
+    candidates = []
+    for index, dim in enumerate(DIMENSIONS):
+        magnitude = abs(user_z[index])
+        if dim in {"instrumentalness", "era"} and magnitude <= 1:
+            continue
+        agreement = 1 / (1 + abs(user_z[index] - title_z[index]))
+        candidates.append((agreement * magnitude, index, dim))
+    candidates.sort(reverse=True)
     phrases = [
-        f"{'High' if user[dim] >= 0.5 else 'Low'} {DIM_LABELS[dim]}"
-        for dim in closest
+        DIM_PHRASES[dim][1 if user_z[index] >= 0 else 0]
+        for _, index, dim in candidates[:2]
     ]
-    return f"{', '.join(phrases)}: matches your {MOOD_PHRASES[archetype]} taste."
+    chosen = int.from_bytes(hashlib.sha256(title_id.encode()).digest()[:4], "big")
+    return WHY_TEMPLATES[chosen % len(WHY_TEMPLATES)].format(
+        phrases=" and ".join(phrases) if phrases else "distinctive"
+    )
 
 
 def _candidate(
@@ -225,8 +234,9 @@ def _candidate(
         else float(item.get("total_rating", 0) or 0) / 100
     )
     novelty = 1.0 - abs(user["mainstream"] - vector["mainstream"])
-    score = 0.60 * _cosine(user, vector) + 0.30 * quality + 0.10 * novelty
-    score *= weight
+    raw_score = 0.60 * _cosine(user, vector) + 0.30 * quality + 0.10 * novelty
+    score = raw_score * weight
+    match_pct = round(max(60, min(98, 60 + (raw_score - 0.35) * 95)))
     ids = _genre_set(item, kind, tmdb_genres if kind == "movie" else igdb_genres)
     if kind == "movie":
         title = str(item.get("title", ""))
@@ -252,7 +262,8 @@ def _candidate(
         "year": year,
         "image_url": image_url,
         "score": score,
-        "why": _explanation(user, vector, archetype),
+        "match_pct": match_pct,
+        "why": _explanation(user, vector, str(item.get("id", ""))),
         "source_url": source_url,
         "_genres": ids,
         "_vector": vector,
@@ -363,6 +374,16 @@ class RankingService:
             primary, secondary, tmdb_map, igdb_map, theme_map,
             tmdb_image_base,
         )
+        degraded_reasons = sorted({
+            f"Unresolved TMDB keyword: {keyword}"
+            for pool in (primary_pool, secondary_pool)
+            for keyword in pool.get("unresolved_keywords", [])
+        })
+        has_degradation = (
+            primary_pool["degraded"] or secondary_pool["degraded"] or not configuration.ok
+        )
+        if has_degradation and not degraded_reasons:
+            degraded_reasons.append("One or more catalog signals were unavailable.")
         return {
             "movies": _mmr(movies),
             "games": _mmr(games),
@@ -375,6 +396,7 @@ class RankingService:
                 primary_pool.get("upstream_error", False)
                 or secondary_pool.get("upstream_error", False)
             ),
+            "degraded_reasons": degraded_reasons,
         }
 
     async def _pools_and_ids(

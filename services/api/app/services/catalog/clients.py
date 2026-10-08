@@ -32,8 +32,7 @@ class ConfigError(ValueError):
 def clean_env_value(name: str, value: str | None = None) -> str:
     """Read an environment value after removing common copy/paste wrappers."""
     raw = os.getenv(name, "") if value is None else value
-    # Explicitly drop the ellipsis character \u2026 before validation
-    return raw.strip().strip("\ufeff").replace("\u2026", "").strip().strip("\"'").strip()
+    return raw.strip().strip("\ufeff").strip().strip("\"'").strip()
 
 
 
@@ -45,12 +44,6 @@ def build_headers(values: dict[str, tuple[str, str]]) -> dict[str, str]:
         try:
             cleaned.encode("ascii")
         except UnicodeEncodeError as exc:
-            # --- DIAGNOSTIC PRINT ADDED HERE ---
-            print(f"\n!!! CONFIG CONFIGURATION ERROR !!!")
-            print(f"Env Variable Name: {env_name}")
-            print(f"Cleaned Header Value Evaluated: {repr(cleaned)}")
-            print(f"Non-ASCII Character Bytes: {cleaned.encode('utf-8', errors='replace')}\n")
-            # -----------------------------------
             raise ConfigError(
                 f"{env_name} contains non-ASCII characters; re-copy the full token"
             ) from exc
@@ -786,7 +779,7 @@ def build_apicalypse(
     genre_ids: list[int], theme_ids: list[int], mode: str = "combined"
 ) -> str:
     """Build an IGDB games query using runtime-resolved genre/theme IDs."""
-    clauses = ["total_rating_count >= 50"]
+    clauses = ["total_rating_count >= 100", "total_rating >= 65"]
     if genre_ids and mode in {"combined", "genres"}:
         clauses.append(f"genres = ({','.join(str(value) for value in genre_ids)})")
     if theme_ids and mode in {"combined", "themes"}:
