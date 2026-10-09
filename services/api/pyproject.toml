@@ -28,4 +28,8 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.setuptools]
-packages = ["app", "spike", "cerebro"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "spike*", "cerebro*"]

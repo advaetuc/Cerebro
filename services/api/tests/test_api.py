@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
-from app.main import app, get_lastfm_client, get_ranking_service
+from app.main import app, cors_settings, get_lastfm_client, get_ranking_service
 from app.services.catalog.clients import ConfigError
 from spike.lastfm_client import LastFmResult
 
@@ -21,6 +23,9 @@ class FakeLastFm:
         return LastFmResult(
             "user.getTopArtists", 200, {"topartists": {"artist": entries}}
         )
+
+    def user_get_info(self, username: str) -> LastFmResult:
+        return LastFmResult("user.getInfo", 200, {"user": {"playcount": "100"}})
 
     def artist_top_tags(self, artist: str) -> LastFmResult:
         tags = [
@@ -107,7 +112,104 @@ def test_lastfm_analyze_requires_five_artists() -> None:
         response = client.post("/analyze", json={"mode": "lastfm", "username": "listener"})
     app.dependency_overrides.clear()
     assert response.status_code == 422
-    assert "at least five" in response.json()["detail"]
+    assert "at least five" in response.json()["message"]
+
+
+def test_unknown_lastfm_user_returns_404_message() -> None:
+    class UnknownUser(FakeLastFm):
+        def user_get_info(self, username: str) -> LastFmResult:
+            return LastFmResult(
+                "user.getInfo", 200,
+                {"error": 6, "message": "User not found"}, 6, "User not found",
+            )
+
+    with _client(UnknownUser()) as client:
+        response = client.post(
+            "/analyze", json={"mode": "lastfm", "username": "no_such_user"}
+        )
+    app.dependency_overrides.clear()
+    assert response.status_code == 404
+    assert response.json() == {
+        "message": "We couldn't find that Last.fm username. Check the spelling "
+        "and that the profile is public."
+    }
+
+
+def test_private_and_empty_profiles_return_friendly_422() -> None:
+    class PrivateUser(FakeLastFm):
+        def user_get_info(self, username: str) -> LastFmResult:
+            return LastFmResult(
+                "user.getInfo", 200,
+                {"error": 17, "message": "User does not have a public profile"},
+                17,
+                "User does not have a public profile",
+            )
+
+    with _client(PrivateUser()) as client:
+        private = client.post(
+            "/analyze", json={"mode": "lastfm", "username": "private_user"}
+        )
+    app.dependency_overrides.clear()
+    with _client(FakeLastFm(artists=0)) as client:
+        empty = client.post(
+            "/analyze", json={"mode": "lastfm", "username": "empty_user"}
+        )
+    app.dependency_overrides.clear()
+    assert private.status_code == 422
+    assert "private" in private.json()["message"]
+    assert empty.status_code == 422
+    assert "listening artists" in empty.json()["message"]
+
+
+def test_bad_username_and_seed_inputs_return_422() -> None:
+    with _client() as client:
+        invalid_username = client.post(
+            "/analyze", json={"mode": "lastfm", "username": "user name"}
+        )
+        duplicate_seed = client.post(
+            "/analyze", json={"mode": "seed", "artists": ["One", "one", "Three"]}
+        )
+        short_seed = client.post(
+            "/analyze", json={"mode": "seed", "artists": ["One", "Two"]}
+        )
+        long_artist = client.post(
+            "/analyze", json={"mode": "seed", "artists": ["x" * 101, "Two", "Three"]}
+        )
+    app.dependency_overrides.clear()
+    assert all(
+        response.status_code == 422
+        for response in (invalid_username, duplicate_seed, short_seed, long_artist)
+    )
+
+
+def test_analyze_rate_limit_returns_retry_after() -> None:
+    with _client() as client:
+        responses = [
+            client.post("/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]})
+            for _ in range(11)
+        ]
+    app.dependency_overrides.clear()
+    assert responses[-1].status_code == 429
+    assert int(responses[-1].headers["Retry-After"]) >= 1
+    assert "wait a moment" in responses[-1].json()["message"]
+
+
+def test_production_cors_allows_only_configured_origins() -> None:
+    cors_app = FastAPI()
+    cors_app.add_middleware(
+        CORSMiddleware,
+        **cors_settings("production", "https://web.example", ""),
+    )
+
+    @cors_app.get("/probe")
+    async def probe():
+        return {"ok": True}
+
+    with TestClient(cors_app) as client:
+        allowed = client.get("/probe", headers={"Origin": "https://web.example"})
+        denied = client.get("/probe", headers={"Origin": "https://other.example"})
+    assert allowed.headers["access-control-allow-origin"] == "https://web.example"
+    assert "access-control-allow-origin" not in denied.headers
 
 
 def test_config_error_returns_503_with_clear_message() -> None:

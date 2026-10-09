@@ -7,7 +7,6 @@ import hashlib
 import logging
 import math
 import time
-from pathlib import Path
 from typing import Any
 
 from app.services.catalog.clients import (
@@ -16,6 +15,7 @@ from app.services.catalog.clients import (
     ConfigError,
     JsonDiskCache,
     build_multiquery,
+    get_cache_dir,
     redact_secrets,
 )
 from app.services.catalog.retrieval import (
@@ -29,7 +29,6 @@ from app.services.vibe.archetypes import ARCHETYPES, _standardize
 from app.services.vibe.genre_priors import DIMENSIONS, FAMILY_BY_ID
 
 POOL_TTL_SECONDS = 24 * 60 * 60
-POOL_CACHE_DIR = Path(__file__).resolve().parents[2] / "spike" / ".cache" / "catalog" / "pools"
 MMR_LAMBDA = 0.7
 TOP_K = 10
 REGIONAL_FAMILIES = {
@@ -366,7 +365,9 @@ class RankingService:
         ttl_seconds: int = POOL_TTL_SECONDS,
     ) -> None:
         self.clients = clients
-        self.disk_cache = disk_cache or JsonDiskCache(POOL_CACHE_DIR, ttl_seconds)
+        self.disk_cache = disk_cache or JsonDiskCache(
+            get_cache_dir() / "catalog" / "pools", ttl_seconds
+        )
         self.ttl_seconds = ttl_seconds
         self._memory: dict[str, tuple[float, dict[str, Any]]] = {}
         self._locks: dict[str, asyncio.Lock] = {}

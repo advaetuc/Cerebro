@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,10 +13,17 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from app.services.catalog.clients import ConfigError, clean_env_value
+from app.services.catalog.clients import (
+    ConfigError,
+    clean_env_value,
+    ensure_cache_directory,
+    get_cache_dir,
+    redact_secrets,
+)
 
 API_URL = "https://ws.audioscrobbler.com/2.0/"
-CACHE_DIR = Path(__file__).resolve().parent / ".cache"
+CACHE_DIR = get_cache_dir()
+logger = logging.getLogger("cerebro.cache")
 
 
 @dataclass(frozen=True)
@@ -65,14 +73,19 @@ class LastFmClient:
         max_retries: int = 3,
         cache_dir: Path | None = None,
     ) -> None:
-        load_dotenv(encoding="utf-8-sig")
+        load_dotenv(
+            dotenv_path=Path(__file__).resolve().parents[1] / ".env",
+            encoding="utf-8-sig",
+        )
         self.api_key = clean_env_value("LASTFM_API_KEY", api_key)
         if not self.api_key:
             raise ConfigError("Set LASTFM_API_KEY in services/api/.env")
         self.limiter = limiter or RateLimiter()
         self.client = httpx.Client(transport=transport, timeout=20)
         self.max_retries = max_retries
-        self.cache_dir = cache_dir or CACHE_DIR
+        self.cache_dir = cache_dir or get_cache_dir()
+        self._cache_memory: dict[str, LastFmResult] = {}
+        self._memory_only = not ensure_cache_directory(self.cache_dir)
 
     def _cache_path(self, method: str, params: dict[str, str | int]) -> Path:
         cache_key = json.dumps(
@@ -85,6 +98,11 @@ class LastFmClient:
 
     def _cached_result(self, method: str, params: dict[str, str | int]) -> LastFmResult | None:
         path = self._cache_path(method, params)
+        cache_key = path.name
+        if cache_key in self._cache_memory:
+            return self._cache_memory[cache_key]
+        if self._memory_only:
+            return None
         try:
             cached = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -104,20 +122,31 @@ class LastFmClient:
         params: dict[str, str | int],
         result: LastFmResult,
     ) -> None:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         path = self._cache_path(method, params)
-        path.write_text(
-            json.dumps(
-                {
-                    "status": result.status,
-                    "data": result.data,
-                    "error_code": result.error_code,
-                    "error_message": result.error_message,
-                    "query_param_names": result.query_param_names,
-                }
-            ),
-            encoding="utf-8",
-        )
+        self._cache_memory[path.name] = result
+        if self._memory_only:
+            return
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "data": result.data,
+                        "error_code": result.error_code,
+                        "error_message": result.error_message,
+                        "query_param_names": result.query_param_names,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self._memory_only = True
+            logger.warning(
+                "CACHE_DIR became unwritable; using memory-only cache (%s: %s)",
+                type(exc).__name__,
+                str(exc)[:120],
+            )
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -135,13 +164,16 @@ class LastFmClient:
                     API_URL,
                     params=query_params,
                 )
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 if attempt == self.max_retries:
                     return LastFmResult(
                         method,
                         None,
                         {},
-                        error_message="HTTP request failed",
+                        error_message=(
+                            f"{type(exc).__name__}: "
+                            f"{redact_secrets(str(exc))[:120]}"
+                        ),
                         query_param_names=tuple(query_params),
                     )
                 time.sleep(min(2**attempt * 0.25, 4.0))

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import random
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -20,7 +22,9 @@ from dotenv import load_dotenv
 TMDB_BASE = "https://api.themoviedb.org/3"
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 IGDB_BASE = "https://api.igdb.com/v4"
-CACHE_DIR = Path(__file__).resolve().parents[3] / "spike" / ".cache" / "catalog"
+API_DIR = Path(__file__).resolve().parents[3]
+DEVELOPMENT_CACHE_DIR = API_DIR / "spike" / ".cache"
+CACHE_DIR = DEVELOPMENT_CACHE_DIR / "catalog"
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 TMDB_MAX_RETRIES = 3
 TMDB_BACKOFF_SECONDS = (0.2, 0.6, 1.2)
@@ -28,6 +32,41 @@ TMDB_BACKOFF_SECONDS = (0.2, 0.6, 1.2)
 
 class ConfigError(ValueError):
     """Describe invalid local application configuration."""
+
+
+def environment_mode() -> str:
+    """Return the validated deployment environment."""
+    value = clean_env_value("ENV") or "development"
+    if value not in {"development", "production"}:
+        raise ConfigError("ENV must be development or production")
+    return value
+
+
+def get_cache_dir() -> Path:
+    """Resolve the configured disk-cache root for this process."""
+    load_dotenv(dotenv_path=API_DIR / ".env", encoding="utf-8-sig")
+    configured = clean_env_value("CACHE_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    if environment_mode() == "production":
+        return Path("/tmp/cerebro-cache")
+    return DEVELOPMENT_CACHE_DIR
+
+
+def ensure_cache_directory(directory: Path) -> bool:
+    """Probe cache writability and fall back to memory when unavailable."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".cerebro-check-", delete=True):
+            pass
+    except OSError as exc:
+        logging.getLogger("cerebro.cache").warning(
+            "CACHE_DIR is not writable; using memory-only cache (%s: %s)",
+            type(exc).__name__,
+            str(exc)[:120],
+        )
+        return False
+    return True
 
 
 def clean_env_value(name: str, value: str | None = None) -> str:
@@ -206,9 +245,11 @@ def _warm_copy(result: CatalogResult) -> CatalogResult:
 class JsonDiskCache:
     """Cache catalog ID lists with a bounded TTL."""
 
-    def __init__(self, directory: Path = CACHE_DIR, ttl: int = CACHE_TTL_SECONDS) -> None:
-        self.directory = directory
+    def __init__(self, directory: Path | None = None, ttl: int = CACHE_TTL_SECONDS) -> None:
+        self.directory = directory or get_cache_dir() / "catalog"
         self.ttl = ttl
+        self._memory: dict[str, dict[str, Any]] = {}
+        self._memory_only = not ensure_cache_directory(self.directory)
 
     def _path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -229,6 +270,10 @@ class JsonDiskCache:
         return payload.get("value") if payload else None
 
     def _read_entry(self, key: str) -> dict[str, Any] | None:
+        if key in self._memory:
+            return self._memory[key]
+        if self._memory_only:
+            return None
         try:
             value = json.loads(self._path(key).read_text(encoding="utf-8"))
             return value if isinstance(value, dict) else None
@@ -237,10 +282,20 @@ class JsonDiskCache:
 
     def set(self, key: str, value: Any) -> None:
         """Persist an ID-list value with its creation time."""
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self._path(key).write_text(
-            json.dumps({"saved_at": time.time(), "value": value}), encoding="utf-8"
-        )
+        payload = {"saved_at": time.time(), "value": value}
+        self._memory[key] = payload
+        if self._memory_only:
+            return
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self._path(key).write_text(json.dumps(payload), encoding="utf-8")
+        except OSError as exc:
+            self._memory_only = True
+            logging.getLogger("cerebro.cache").warning(
+                "CACHE_DIR became unwritable; using memory-only cache (%s: %s)",
+                type(exc).__name__,
+                str(exc)[:120],
+            )
 
 
 def _api_error(response: httpx.Response, payload: Any) -> tuple[str | int | None, str | None]:
@@ -297,8 +352,7 @@ class CatalogClients:
         igdb_concurrency: int = 8,
         token_path: Path | None = None,
     ) -> None:
-        from pathlib import Path
-        load_dotenv(dotenv_path=Path(__file__).resolve().parents[3] / ".env", encoding="utf-8-sig")
+        load_dotenv(dotenv_path=API_DIR / ".env", encoding="utf-8-sig")
         self.tmdb_token = clean_env_value("TMDB_READ_TOKEN", tmdb_token)
         self.client_id = clean_env_value("TWITCH_CLIENT_ID", twitch_client_id)
         self.client_secret = clean_env_value("TWITCH_CLIENT_SECRET", twitch_client_secret)
@@ -316,7 +370,7 @@ class CatalogClients:
         self.igdb_bucket = igdb_bucket or AsyncTokenBucket(4, 4)
         self.tmdb_semaphore = asyncio.Semaphore(tmdb_concurrency)
         self.igdb_semaphore = asyncio.Semaphore(igdb_concurrency)
-        self.token_path = token_path or CACHE_DIR / "igdb_token.json"
+        self.token_path = token_path or get_cache_dir() / "catalog" / "igdb_token.json"
         self._token: str | None = None
         self._token_expiry = 0.0
         self._token_lock = asyncio.Lock()
@@ -652,11 +706,18 @@ class CatalogClients:
             )
         self._token = str(access_token)
         self._token_expiry = now + float(expires_in)
-        self.token_path.parent.mkdir(parents=True, exist_ok=True)
-        self.token_path.write_text(
-            json.dumps({"access_token": self._token, "expires_at": self._token_expiry}),
-            encoding="utf-8",
-        )
+        try:
+            self.token_path.parent.mkdir(parents=True, exist_ok=True)
+            self.token_path.write_text(
+                json.dumps({"access_token": self._token, "expires_at": self._token_expiry}),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logging.getLogger("cerebro.cache").warning(
+                "CACHE_DIR is not writable; keeping IGDB token in memory (%s: %s)",
+                type(exc).__name__,
+                str(exc)[:120],
+            )
         return CatalogResult("oauth/token", 200, {"access_token": self._token})
 
     async def _igdb_ids(self, endpoint: str) -> CatalogResult:

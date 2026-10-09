@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: cerebro-api
+    runtime: python
+    rootDir: services/api
+    plan: free
+    buildCommand: pip install .
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: LASTFM_API_KEY
+        sync: false
+      - key: TMDB_READ_TOKEN
+        sync: false
+      - key: TWITCH_CLIENT_ID
+        sync: false
+      - key: TWITCH_CLIENT_SECRET
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false

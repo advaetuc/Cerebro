@@ -7,6 +7,7 @@ import json
 import httpx
 
 from app.services.catalog.clients import (
+    DEVELOPMENT_CACHE_DIR,
     AsyncRateLimiter,
     AsyncTokenBucket,
     CatalogClients,
@@ -17,6 +18,7 @@ from app.services.catalog.clients import (
     build_headers,
     build_multiquery,
     build_tmdb_params,
+    get_cache_dir,
     redact_secrets,
     select_keyword_match,
     tmdb_backoff_delay,
@@ -306,8 +308,29 @@ def test_id_cache_exposes_expired_pool_as_stale(tmp_path) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["saved_at"] = 0
     path.write_text(json.dumps(payload), encoding="utf-8")
+    cache._memory.clear()
     assert cache.get("pool:test") is None
     assert cache.get_stale("pool:test") == {"movies": [{"id": 1}]}
+
+
+def test_cache_dir_falls_back_to_memory_when_unwritable(tmp_path, caplog) -> None:
+    file_path = tmp_path / "not-a-directory"
+    file_path.write_text("block", encoding="utf-8")
+    cache = JsonDiskCache(file_path / "cache")
+    cache.set("memory", {"ok": True})
+    assert cache.get("memory") == {"ok": True}
+    assert "memory-only cache" in caplog.text
+
+
+def test_cache_dir_environment_defaults_and_override(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("CACHE_DIR", "")
+    assert get_cache_dir().as_posix() == "/tmp/cerebro-cache"
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache-root"))
+    assert get_cache_dir() == tmp_path / "cache-root"
+    monkeypatch.setenv("ENV", "development")
+    monkeypatch.setenv("CACHE_DIR", "")
+    assert get_cache_dir() == DEVELOPMENT_CACHE_DIR
 
 
 def test_keyword_match_prefers_exact_then_highest_rank() -> None:

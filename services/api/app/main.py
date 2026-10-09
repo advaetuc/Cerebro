@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
+import os
+import re
 import sys
 import time
+from collections import deque
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -13,12 +20,14 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 
 from app.services.catalog.clients import (
     CatalogClients,
     ConfigError,
     clean_env_value,
+    environment_mode,
+    get_cache_dir,
     redact_secrets,
 )
 from app.services.ranking import RankingService
@@ -26,7 +35,11 @@ from app.services.vibe import ArtistInput, VibeResolver
 from spike.lastfm_client import LastFmClient, LastFmResult
 
 ANALYZE_CACHE_SECONDS = 15 * 60
+API_ROOT = Path(__file__).resolve().parents[1]
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
+DEVELOPMENT_CORS_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 logger = logging.getLogger("cerebro.upstream")
+request_logger = logging.getLogger("cerebro.request")
 ATTRIBUTION = [
     "Data provided by Last.fm",
     "This product uses the TMDB API but is not endorsed or certified by TMDB.",
@@ -36,14 +49,109 @@ JUNK_TAGS = frozenset(
     {"seen live", "favorites", "favourite", "favourites", "albums i own", "spotify"}
 )
 
+load_dotenv(dotenv_path=API_ROOT / ".env", encoding="utf-8-sig")
+
+
+def cors_settings(
+    mode: str | None = None,
+    origins: str | None = None,
+    origin_regex: str | None = None,
+) -> dict[str, Any]:
+    """Build exact CORS origins and the optional origin regular expression."""
+    environment = mode or clean_env_value("ENV") or "development"
+    origin_value = os.getenv("CORS_ORIGINS", "") if origins is None else origins
+    regex_value = (
+        os.getenv("CORS_ORIGIN_REGEX", "")
+        if origin_regex is None
+        else origin_regex
+    ).strip()
+    allow_regex = regex_value or None
+    if environment == "development":
+        allow_regex = (
+            f"(?:{DEVELOPMENT_CORS_REGEX})|(?:{regex_value})"
+            if regex_value
+            else DEVELOPMENT_CORS_REGEX
+        )
+    return {
+        "allow_origins": [origin.strip() for origin in origin_value.split(",") if origin.strip()],
+        "allow_origin_regex": allow_regex,
+        "allow_credentials": True,
+        "allow_methods": ["GET", "POST"],
+        "allow_headers": ["Content-Type", "Authorization"],
+    }
+
+
+class AnalysisGuard:
+    """Enforce per-IP sliding windows and a process-wide analysis semaphore."""
+
+    def __init__(self, *, per_minute: int = 10, per_hour: int = 60) -> None:
+        self.per_minute = per_minute
+        self.per_hour = per_hour
+        self.requests: dict[str, deque[float]] = {}
+        self.semaphore = asyncio.Semaphore(3)
+
+    def check_ip(self, client_ip: str, now: float | None = None) -> None:
+        timestamp = time.monotonic() if now is None else now
+        history = self.requests.setdefault(client_ip, deque())
+        while history and timestamp - history[0] >= 3600:
+            history.popleft()
+        minute = [event for event in history if timestamp - event < 60]
+        wait_seconds = 0.0
+        if len(minute) >= self.per_minute:
+            wait_seconds = max(wait_seconds, 60 - (timestamp - minute[0]))
+        if len(history) >= self.per_hour:
+            wait_seconds = max(wait_seconds, 3600 - (timestamp - history[0]))
+        if wait_seconds > 0:
+            raise RateLimitError(math.ceil(wait_seconds))
+        history.append(timestamp)
+
+
+class RateLimitError(RuntimeError):
+    """Describe a temporary analysis rate or concurrency limit."""
+
+    def __init__(self, retry_after: int) -> None:
+        self.retry_after = max(1, retry_after)
+        super().__init__("Too many analyses are running. Please wait a moment and try again.")
+
+
+class UserNotFoundError(RuntimeError):
+    """Represent Last.fm's unknown-user response."""
+
+
+class EmptyListeningError(RuntimeError):
+    """Represent a private profile or profile without public listening history."""
+
+
 app = FastAPI(title="Cerebro API", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, **cors_settings())
+app.state.analysis_guard = AnalysisGuard()
+app.state.analyze_cache = {}
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """Emit one production request line without query-string data."""
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        if (clean_env_value("ENV") or "development") == "production":
+            request_logger.info(
+                "request method=%s path=%s status=500 duration_ms=%.2f",
+                request.method,
+                request.url.path,
+                (time.perf_counter() - started) * 1000,
+            )
+        raise
+    if (clean_env_value("ENV") or "development") == "production":
+        request_logger.info(
+            "request method=%s path=%s status=%s duration_ms=%.2f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            (time.perf_counter() - started) * 1000,
+        )
+    return response
 
 
 class AnalyzeRequest(BaseModel):
@@ -52,6 +160,32 @@ class AnalyzeRequest(BaseModel):
     mode: str
     username: str | None = None
     artists: list[str] | None = None
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def trim_username(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("artists", mode="before")
+    @classmethod
+    def trim_artist_names(cls, value: Any) -> Any:
+        return [artist.strip() if isinstance(artist, str) else artist for artist in value] \
+            if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_mode_input(self) -> AnalyzeRequest:
+        if self.mode == "lastfm":
+            if self.username is None or not USERNAME_PATTERN.fullmatch(self.username):
+                raise ValueError("Last.fm username must be 2–32 letters, numbers, '_' or '-'.")
+        if self.mode == "seed":
+            artists = self.artists or []
+            if len(artists) != 3:
+                raise ValueError("Choose exactly three distinct artists.")
+            if any(not name or len(name) > 100 for name in artists):
+                raise ValueError("Each artist name must be between 1 and 100 characters.")
+            if len({name.casefold() for name in artists}) != 3:
+                raise ValueError("Choose exactly three distinct artists.")
+        return self
 
 
 class UpstreamError(RuntimeError):
@@ -84,14 +218,24 @@ def _log_upstream_failure(provider: str, endpoint: str, exception: str, message:
 @app.on_event("startup")
 async def startup() -> None:
     """Initialize shared clients and preserve clear startup configuration errors."""
-    load_dotenv(encoding="utf-8-sig")
+    load_dotenv(dotenv_path=API_ROOT / ".env", encoding="utf-8-sig")
     app.state.config_error = None
     app.state.analyze_cache = {}
+    app.state.analysis_guard = AnalysisGuard()
     app.state.lastfm = None
     app.state.catalog = None
     app.state.ranker = None
-    app.state.catalog = CatalogClients()
-    app.state.ranker = RankingService(app.state.catalog)
+    try:
+        if environment_mode() == "production":
+            request_logger.setLevel(logging.INFO)
+        get_cache_dir()
+        app.state.catalog = CatalogClients()
+        app.state.ranker = RankingService(app.state.catalog)
+    except ConfigError as exc:
+        app.state.config_error = str(exc)
+        print(str(exc), file=sys.stderr)
+    if app.state.config_error:
+        return
     if clean_env_value("LASTFM_API_KEY"):
         try:
             app.state.lastfm = LastFmClient()
@@ -116,6 +260,34 @@ async def config_error_handler(request: Request, exc: ConfigError) -> JSONRespon
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
+@app.exception_handler(UserNotFoundError)
+async def user_not_found_handler(request: Request, exc: UserNotFoundError) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "message": "We couldn't find that Last.fm username. Check the spelling "
+            "and that the profile is public."
+        },
+    )
+
+
+@app.exception_handler(EmptyListeningError)
+async def empty_listening_handler(request: Request, exc: EmptyListeningError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"message": str(exc) or "This profile has no public listening history yet."},
+    )
+
+
+@app.exception_handler(RateLimitError)
+async def rate_limit_handler(request: Request, exc: RateLimitError) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(exc.retry_after)},
+        content={"message": str(exc)},
+    )
+
+
 @app.exception_handler(UpstreamError)
 async def upstream_error_handler(request: Request, exc: UpstreamError) -> JSONResponse:
     _log_upstream_failure(exc.provider, exc.endpoint, exc.exception_class, exc.reason)
@@ -131,6 +303,26 @@ async def http_error_handler(request: Request, exc: httpx.HTTPError) -> JSONResp
     return JSONResponse(status_code=502, content={
         "provider": "upstream", "reason": "An upstream service request failed."
     })
+
+
+async def analysis_guard(request: Request) -> AsyncIterator[None]:
+    """Apply per-IP limits and reserve one of three global analysis slots."""
+    limiter = getattr(request.app.state, "analysis_guard", None)
+    if limiter is None:
+        limiter = request.app.state.analysis_guard = AnalysisGuard()
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",", 1)[0].strip()
+    if not client_ip:
+        client_ip = request.client.host if request.client else "unknown"
+    limiter.check_ip(client_ip)
+    try:
+        await asyncio.wait_for(limiter.semaphore.acquire(), timeout=15)
+    except TimeoutError as exc:
+        raise RateLimitError(15) from exc
+    try:
+        yield
+    finally:
+        limiter.semaphore.release()
 
 
 def get_lastfm_client(request: Request) -> LastFmClient:
@@ -169,12 +361,34 @@ def _items(result: LastFmResult, *path: str) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
-def _require_success(result: LastFmResult) -> None:
+def _lastfm_failure(result: LastFmResult) -> tuple[str, str]:
+    """Return a safe exception class and concise upstream failure reason."""
+    message = result.error_message or f"HTTP {result.status}"
+    if result.status is None:
+        exception, separator, reason = message.partition(": ")
+        if separator and exception.isidentifier():
+            return exception, reason[:120]
+        return "TransportError", message[:120]
+    return (
+        "HTTPStatusError" if result.status >= 400 else "LastFmAPIError",
+        message[:120],
+    )
+
+
+def _require_success(result: LastFmResult, *, user_lookup: bool = False) -> None:
     if not result.ok:
-        exception = "TransportError" if result.status is None else (
-            "HTTPStatusError" if result.status >= 400 else "LastFmAPIError"
-        )
-        reason = result.error_message or f"HTTP {result.status}"
+        message = result.error_message or ""
+        if user_lookup and result.error_code == 6:
+            raise UserNotFoundError(message)
+        if user_lookup and (
+            result.error_code == 17
+            or result.status == 403
+            or "private" in message.casefold()
+        ):
+            raise EmptyListeningError(
+                "This Last.fm profile is private or has no public listening history."
+            )
+        exception, reason = _lastfm_failure(result)
         raise UpstreamError("Last.fm", result.endpoint, reason, exception)
 
 
@@ -204,12 +418,9 @@ def _artist_payload(result: LastFmResult) -> dict[str, Any]:
 
 
 def _log_lastfm_result_failure(result: LastFmResult) -> None:
-    exception = "TransportError" if result.status is None else (
-        "HTTPStatusError" if result.status >= 400 else "LastFmAPIError"
-    )
+    exception, message = _lastfm_failure(result)
     _log_upstream_failure(
-        "Last.fm", result.endpoint, exception,
-        result.error_message or f"HTTP {result.status}",
+        "Last.fm", result.endpoint, exception, message,
     )
 
 
@@ -223,7 +434,7 @@ def _top_artists(client: LastFmClient, username: str) -> list[dict[str, Any]]:
     combined: dict[str, dict[str, Any]] = {}
     for period in ("6month", "overall"):
         result = client.user_top_artists(username, period, limit=50)
-        _require_success(result)
+        _require_success(result, user_lookup=True)
         for item in _items(result, "topartists", "artist"):
             name = str(item.get("name", "")).strip()
             if not name:
@@ -329,7 +540,7 @@ async def search_artists(
 
 
 def _analyze_key(payload: AnalyzeRequest) -> str:
-    return json.dumps(payload.dict(), sort_keys=True, separators=(",", ":"))
+    return json.dumps(payload.model_dump(), sort_keys=True, separators=(",", ":"))
 
 
 @app.post("/analyze")
@@ -338,6 +549,7 @@ async def analyze(
     request: Request,
     lastfm: LastFmClient = Depends(get_lastfm_client),  # noqa: B008
     ranker: RankingService = Depends(get_ranking_service),  # noqa: B008
+    _guard: None = Depends(analysis_guard),  # noqa: B008
 ) -> dict[str, Any]:
     """Resolve listening input and return a ranked recommendation set."""
     if payload.mode not in {"lastfm", "seed"}:
@@ -352,13 +564,22 @@ async def analyze(
     try:
         if payload.mode == "lastfm":
             username = (payload.username or "").strip()
-            if not username:
-                raise HTTPException(status_code=422, detail="Enter a Last.fm username.")
+            info_result = lastfm.user_get_info(username)
+            _require_success(info_result, user_lookup=True)
+            profile = info_result.data.get("user", {})
+            profile = profile if isinstance(profile, dict) else {}
+            try:
+                playcount = int(profile.get("playcount", 0) or 0)
+            except (TypeError, ValueError):
+                playcount = 0
+            if playcount <= 0:
+                raise EmptyListeningError(
+                    "This Last.fm profile has no public listening history yet."
+                )
             artists = _top_artists(lastfm, username)
             if len(artists) < 5:
-                raise HTTPException(
-                    status_code=422,
-                    detail="We need at least five listening artists to build your vibe.",
+                raise EmptyListeningError(
+                    "We need at least five listening artists to build your vibe."
                 )
             artist_inputs = [_resolve_artist(lastfm, artist) for artist in artists[:40]]
         else:
@@ -398,6 +619,8 @@ async def analyze(
         cache[key] = (time.time() + ANALYZE_CACHE_SECONDS, response)
         return response
     except ConfigError:
+        raise
+    except (UserNotFoundError, EmptyListeningError):
         raise
     except HTTPException:
         raise

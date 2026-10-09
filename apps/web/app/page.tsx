@@ -2,7 +2,7 @@
 
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { analyze, searchArtists, type Artist, type VibeResult } from "../lib/api";
+import { analyze, prewarmApi, searchArtists, type Artist, type VibeResult } from "../lib/api";
 import { ARCHETYPE_DESCRIPTIONS, ArtistChip, AuroraBackdrop, GlassPanel, NeonBorder, PosterCard, SignalMeter, VectorBars } from "../components/ui";
 
 type Mode = "lastfm" | "seed";
@@ -22,14 +22,22 @@ export default function Home() {
   const [selected, setSelected] = useState<Artist[]>([]);
   const [searching, setSearching] = useState(false);
   const [stage, setStage] = useState(0);
+  const [waking, setWaking] = useState(false);
   const reduceMotion = useReducedMotion();
 
   useEffect(() => {
+    prewarmApi();
     try {
       const cached = sessionStorage.getItem("cerebro:last-result");
       if (cached) setState({ status: "result", result: JSON.parse(cached) as VibeResult });
     } catch { sessionStorage.removeItem("cerebro:last-result"); }
   }, []);
+
+  useEffect(() => {
+    if (state.status !== "loading") { setWaking(false); return; }
+    const timeout = window.setTimeout(() => setWaking(true), 8_000);
+    return () => window.clearTimeout(timeout);
+  }, [state.status]);
 
   useEffect(() => {
     if (mode !== "seed" || query.trim().length < 2) { setResults([]); return; }
@@ -90,6 +98,7 @@ export default function Home() {
         <div className="loading-orbit" aria-hidden="true"><i /><i /><i /></div>
         <p className="eyebrow">ANALYSIS THEATER</p><h1>Finding your <em>shape.</em></h1>
         <div className="stage-list" aria-live="polite">{STAGES.map((label, index) => <div key={label} className={`stage-line ${index === stage ? "active" : index < stage ? "complete" : ""}`}><span className="stage-mark">{index < stage ? "✓" : `0${index + 1}`}</span><span>{label}</span>{index === stage && <motion.i className="stage-progress" animate={reduceMotion ? undefined : { scaleX: [0.08, 1] }} transition={{ duration: 0.88, ease: "easeInOut" }} />}</div>)}</div>
+        {waking && <p className="waking-note" role="status">Waking up the server. The first visit after a quiet spell can take up to a minute.</p>}
         <p className="loading-note">Your listening data stays yours.</p>
       </motion.section> : result ? <motion.div key="result" className="result-view" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
         <section className="result-hero">

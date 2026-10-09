@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.services.catalog.clients import get_cache_dir
 from app.services.vibe.genre_priors import DIMENSIONS, FAMILIES
 from app.services.vibe.resolver import ArtistInput, VibeResolver
 
@@ -15,7 +16,7 @@ SPIKE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROFILES = SPIKE_DIR / "fixtures" / "profiles.json"
 REPORT_PATH = SPIKE_DIR / "out" / "resolver_report.json"
 EXPECTED_PATH = SPIKE_DIR / "fixtures" / "expected_archetypes.json"
-CACHE_DIR = SPIKE_DIR / ".cache"
+CACHE_DIR = get_cache_dir()
 JUNK_TAGS = frozenset(
     {"seen live", "favorites", "favourite", "favourites", "albums i own", "spotify"}
 )
@@ -24,8 +25,8 @@ JUNK_TAGS = frozenset(
 class LastFmDiskCache:
     """Read Last.fm response bodies from the existing disk cache only."""
 
-    def __init__(self, cache_dir: Path = CACHE_DIR) -> None:
-        self.cache_dir = cache_dir
+    def __init__(self, cache_dir: Path | None = None) -> None:
+        self.cache_dir = cache_dir or get_cache_dir()
 
     def response(self, method: str, **params: str | int) -> dict[str, Any]:
         """Return one cached response body, or an empty mapping on cache miss."""

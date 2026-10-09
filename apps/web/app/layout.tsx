@@ -16,6 +16,11 @@ const geistMono = localFont({
 export const metadata: Metadata = {
   title: "Cerebro — find your listening shape",
   description: "A listening profile translated into films and games.",
+  openGraph: {
+    title: "Cerebro — find your listening shape",
+    description: "A listening profile translated into films and games.",
+    type: "website",
+  },
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
