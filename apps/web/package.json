@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "framer-motion": "^11.18.2",
+    "framer-motion": "^14.0.0",
     "geist": "^1.7.2",
     "next": "^14.2.25",
     "react": "^18.3.1",
