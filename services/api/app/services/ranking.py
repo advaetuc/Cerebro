@@ -36,12 +36,14 @@ from app.services.catalog.retrieval import (
     family_igdb_bodies,
     family_tmdb_query_groups,
     match_tmdb_anchor_result,
+    normalize_catalog_name,
     parse_anchor,
 )
 from app.services.vibe.archetypes import ARCHETYPES, POPULATION_MEAN, POPULATION_STD
 from app.services.vibe.genre_priors import DIMENSIONS
 
 POOL_TTL_SECONDS = 24 * 60 * 60
+POOL_CACHE_VERSION = "v2"
 MMR_LAMBDA = 0.75
 TOP_K = 10
 COMPARABLE_DIMS = ("energy", "valence", "tempo", "era", "mainstream")
@@ -128,6 +130,10 @@ _SOURCE_TEMPLATES = {
         "{article}{genre} pick that fits the {p1}, {p2} mood of your listening.",
         "Your {p1}, {p2} taste finds a match in this {genre} pick.",
     ),
+    "borrowed_anchor": (
+        "Popular with fans of {borrowed_family} and similar music.",
+        "Fans of {borrowed_family} and similar music often enjoy this pick.",
+    ),
 }
 
 
@@ -206,6 +212,18 @@ def _eligible_movie(
     )
 
 
+def _eligible_anchor_rec(
+    item: dict[str, Any], languages: tuple[str, ...], excludes: set[Any], genres: set[Any]
+) -> bool:
+    """Keep anchor recommendations inside the family's film mood and language."""
+    if float(item.get("vote_average", 0) or 0) < 6.3:
+        return False
+    if languages and item.get("original_language") not in languages:
+        return False
+    item_genres = set(item.get("genre_ids", []))
+    return bool(item_genres.intersection(genres)) and not item_genres.intersection(excludes)
+
+
 def _set_source(sources: dict[str, dict[str, str]], key: str, family_id: str, source: str) -> None:
     family_sources = sources.setdefault(key, {})
     current = family_sources.get(family_id)
@@ -215,10 +233,19 @@ def _set_source(sources: dict[str, dict[str, str]], key: str, family_id: str, so
 
 _SOURCE_PRIORITY = {
     "genre": 1,
-    "keyword": 2,
-    "language_genre": 3,
-    "anchor_rec": 4,
-    "anchor": 5,
+    "anchor_rec": 2,
+    "keyword": 3,
+    "language_genre": 4,
+    "borrowed_anchor": 5,
+    "anchor": 6,
+}
+
+BORROWED_GAME_FAMILIES = {
+    "punjabi-pop": "hip-hop",
+    "haryanvi": "hip-hop",
+    "desi-hip-hop": "hip-hop",
+    "hindi-film": "pop",
+    "indian-indie": "alt-indie-rock",
 }
 
 
@@ -269,6 +296,7 @@ def _why(
     keyword: str | None = None,
     kind: str = "movie",
     language: str | None = None,
+    borrowed_from: str | None = None,
 ) -> str:
     family = FAMILY_LABELS.get(family_id, family_id.replace("-", " ").title())
     chosen = int.from_bytes(hashlib.sha256(item_id.encode()).digest()[:4], "big")
@@ -286,6 +314,11 @@ def _why(
         return templates[chosen % len(templates)].format(
             family=family, anchor=anchor or "a related title"
         )
+    if source == "borrowed_anchor":
+        borrowed_family = FAMILY_LABELS.get(
+            borrowed_from or "hip-hop", (borrowed_from or "hip-hop").replace("-", " ").title()
+        )
+        return templates[chosen % len(templates)].format(borrowed_family=borrowed_family)
     if source == "keyword":
         term = keyword or next(
             iter(sorted(FILM_PROFILES.get(family_id, FILM_PROFILES["pop"]).tmdb_keywords)), ""
@@ -338,13 +371,20 @@ def _explanation(user: dict[str, float], title: dict[str, float], title_id: str)
 
 
 def _quality(item: dict[str, Any], kind: str) -> float:
+    return _quality_with_prior(item, kind, 500 if kind == "movie" else 100)
+
+
+def _quality_with_prior(item: dict[str, Any], kind: str, shrinkage: int) -> float:
     if kind == "movie":
         rating = float(item.get("vote_average", 0) or 0)
         count = max(float(item.get("vote_count", 0) or 0), 0)
-        return ((count / (count + 500)) * rating + (500 / (count + 500)) * 6.5) / 10
+        return (
+            (count / (count + shrinkage)) * rating + (shrinkage / (count + shrinkage)) * 6.5
+        ) / 10
     rating = float(item.get("total_rating", 0) or 0) / 100
     count = max(float(item.get("total_rating_count", 0) or 0), 0)
-    return (count / (count + 100)) * rating + (100 / (count + 100)) * 0.70
+    prior = 0.70
+    return (count / (count + shrinkage)) * rating + (shrinkage / (count + shrinkage)) * prior
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
@@ -367,23 +407,42 @@ def _mmr(
         for candidate in candidates
         if candidate.get("matched_family")
     }
-    ordered_ids = family_order or list(
+    family_rows = (
+        family_order
+        if family_order and isinstance(family_order[0], dict)
+        else [
+            {"id": family_id, "share": 1 / max(len(present_ids), 1)}
+            for family_id in (family_order or list(present_ids))
+        ]
+    )
+    ordered_ids = [str(row["id"]) for row in family_rows] or list(
         dict.fromkeys(
             candidate.get("matched_family", {}).get("id")
             for candidate in candidates
             if candidate.get("matched_family")
         )
     )
-    quotas = {
-        family_id: 3 if index == 0 else (2 if index == 1 else 1)
-        for index, family_id in enumerate(ordered_ids[:3])
-        if family_id in present_ids
-    }
-    if limit < 6 and len(quotas) > 1:
-        for index, family_id in enumerate(quotas):
-            quotas[family_id] = max(1, limit - (len(quotas) - 1)) if index == 0 else 1
+    quotas = _allocate_family_slots(candidates, family_rows, limit)
+    family_shares = {str(item["id"]): float(item.get("share", 0)) for item in family_rows}
+    for family_id in ordered_ids:
+        quota = quotas.get(family_id, 0)
+        if quota <= 0 or family_shares.get(family_id, 0) < 0.15:
+            continue
+        anchors = [
+            item
+            for item in remaining
+            if item.get("matched_family", {}).get("id") == family_id
+            and item.get("reason_source") in {"anchor", "borrowed_anchor"}
+        ]
+        required = 2 if quota >= 4 else 1
+        for pick in sorted(anchors, key=lambda item: item["score"], reverse=True)[:required]:
+            if len(selected) >= limit:
+                break
+            selected.append(pick)
+            remaining.remove(pick)
     for family_id, quota in quotas.items():
-        for _ in range(quota):
+        current = sum(item.get("matched_family", {}).get("id") == family_id for item in selected)
+        for _ in range(max(0, quota - current)):
             options = [
                 item for item in remaining if item.get("matched_family", {}).get("id") == family_id
             ]
@@ -443,10 +502,63 @@ def _mmr(
     return picks
 
 
+def _allocate_family_slots(
+    candidates: list[dict[str, Any]], family_order: list[dict[str, Any]] | None, limit: int
+) -> dict[str, int]:
+    """Allocate family quotas proportionally with largest remainders."""
+    if not family_order or limit <= 0:
+        return {}
+    available = {
+        str(row.get("id")): sum(
+            item.get("matched_family", {}).get("id") == row.get("id") for item in candidates
+        )
+        for row in family_order
+        if float(row.get("share", 0)) >= 0.05
+    }
+    weights = {
+        str(row["id"]): max(0.0, float(row.get("share", 0)))
+        for row in family_order
+        if str(row.get("id")) in available and available[str(row["id"])] > 0
+    }
+    denominator = sum(weights.values())
+    if not denominator:
+        return {}
+    exact = {family: limit * weight / denominator for family, weight in weights.items()}
+    quotas = {family: min(available[family], math.floor(value)) for family, value in exact.items()}
+    remainders = sorted(
+        weights,
+        key=lambda family: (-(exact[family] - math.floor(exact[family])), family),
+    )
+    for family in remainders:
+        if sum(quotas.values()) >= limit:
+            break
+        if quotas[family] < available[family]:
+            quotas[family] += 1
+    for row in family_order:
+        family = str(row.get("id"))
+        share = float(row.get("share", 0))
+        if family not in quotas:
+            continue
+        if share >= 0.15:
+            quotas[family] = max(1, quotas[family])
+        elif 0.05 <= share <= 0.10:
+            quotas[family] = min(1, quotas[family])
+    while sum(quotas.values()) > limit:
+        removable = [family for family, quota in quotas.items() if quota > 1]
+        if not removable:
+            break
+        family = min(removable, key=lambda item: weights[item])
+        quotas[family] -= 1
+    return quotas
+
+
 def _selection_filtered(
     items: list[dict[str, Any]], selected: list[dict[str, Any]], kind: str, top_family: str | None
 ) -> list[dict[str, Any]]:
     candidates = items
+    anchor_rec_count = sum(item.get("reason_source") == "anchor_rec" for item in selected)
+    if anchor_rec_count >= 2:
+        candidates = [item for item in candidates if item.get("reason_source") != "anchor_rec"]
     if kind == "movie":
         if top_family not in {"pop", "k-pop", "electropop", "disco-dance", "soundtrack"}:
             animated = sum(bool(item.get("_animation_family")) for item in selected)
@@ -518,7 +630,7 @@ class RankingService:
     ) -> dict[str, Any]:
         anchor_seed = anchor_seed or b"default"
         anchor_key = hashlib.sha256(anchor_seed).hexdigest()[:10]
-        cache_key = f"{family_id}:{anchor_key}"
+        cache_key = f"{POOL_CACHE_VERSION}:{family_id}:{anchor_key}"
         lock = self._locks.setdefault(f"family:{cache_key}", asyncio.Lock())
         async with lock:
             now = time.time()
@@ -562,6 +674,9 @@ class RankingService:
                         pool[kind] = stale[kind]
                         pool.setdefault("sources", {}).update(stale.get("sources", {}))
                         pool.setdefault("anchor_names", {}).update(stale.get("anchor_names", {}))
+                        pool.setdefault("borrowed_names", {}).update(
+                            stale.get("borrowed_names", {})
+                        )
                         stale_served = True
                 if stale_served:
                     logger.warning("serving stale catalog pool family=%s", family_id)
@@ -577,7 +692,8 @@ class RankingService:
         game = GAME_PROFILES[family_id]
         anchor_seed = anchor_seed or b"default"
         film_anchors = _rotated_anchors(film.anchors, anchor_seed)
-        game_anchors = _rotated_anchors(game.anchors, anchor_seed)
+        planned_anchors, borrowed_from = _game_anchor_plan(family_id, game.anchors)
+        game_anchors = _rotated_anchors(planned_anchors, anchor_seed)
         movie_query_groups = family_tmdb_query_groups(film, ids)
         movie_tasks = [self.clients.tmdb_discover(query) for _, query in movie_query_groups]
         movie_calls = await asyncio.gather(*movie_tasks, return_exceptions=True)
@@ -640,8 +756,8 @@ class RankingService:
                     _log_failure("TMDB", recommendation)
                     retrieval_degraded = True
                 for item in _items(recommendation, "results"):
-                    if not _eligible_movie(
-                        item, film.original_languages, exclude_ids, genre_ids, 100, False
+                    if not _eligible_anchor_rec(
+                        item, film.original_languages, exclude_ids, genre_ids
                     ):
                         continue
                     key = str(item["id"])
@@ -663,6 +779,7 @@ class RankingService:
             if isinstance(result, CatalogResult) and not result.ok:
                 _log_failure("IGDB", result)
         game_items: dict[str, dict[str, Any]] = {}
+        borrowed_names: dict[str, str] = {}
         game_theme_ids = {
             ids.get("igdb_themes", {}).get(name.casefold()) for name in game.igdb_themes
         }
@@ -707,7 +824,14 @@ class RankingService:
             if candidate_id is not None:
                 key = str(candidate_id)
                 game_items[key] = candidate
-                _set_source(sources, f"game:{key}", family_id, "anchor")
+                _set_source(
+                    sources,
+                    f"game:{key}",
+                    family_id,
+                    "borrowed_anchor" if borrowed_from else "anchor",
+                )
+                if borrowed_from:
+                    borrowed_names[key] = borrowed_from
             similar = search_matches[0].get("similar_games", []) if search_matches else []
             if similar:
                 result = await self.clients.igdb_games_by_ids(
@@ -721,8 +845,15 @@ class RankingService:
                         continue
                     key = str(item["id"])
                     game_items.setdefault(key, item)
-                    _set_source(sources, f"game:{key}", family_id, "anchor_rec")
+                    _set_source(
+                        sources,
+                        f"game:{key}",
+                        family_id,
+                        "borrowed_anchor" if borrowed_from else "anchor_rec",
+                    )
                     anchor_names.setdefault(f"game:{key}", {})[family_id] = anchor
+                    if borrowed_from:
+                        borrowed_names[key] = borrowed_from
         failed_movies = not movie_items and not any(result.ok for result in movie_results)
         failed_games = not game_items and not any(
             isinstance(result, CatalogResult) and result.ok for result in game_results
@@ -739,6 +870,7 @@ class RankingService:
             "games": list(game_items.values()),
             "sources": sources,
             "anchor_names": anchor_names,
+            "borrowed_names": borrowed_names,
             "keywords": {
                 family_id: next(
                     (
@@ -814,6 +946,11 @@ class RankingService:
         pools = await asyncio.gather(
             *(self._family_pool(fid, ids, artist_hash) for fid in family_ids)
         )
+        anchor_rec_families = {
+            family_ids[index]
+            for index, family in enumerate(families[:2])
+            if index < len(family_ids) and float(family.get("share", 0)) >= 0.15
+        }
         configuration = await self.clients.tmdb_configuration()
         if not configuration.ok:
             _log_failure("TMDB", configuration)
@@ -826,8 +963,11 @@ class RankingService:
         tmdb_map = _catalog_maps(tmdb_genres or _dict_list(ids.get("tmdb_genres", {})))
         igdb_map = _catalog_maps(igdb_genres or _dict_list(ids.get("igdb_genres", {})))
         theme_map = _catalog_maps(igdb_themes or _dict_list(ids.get("igdb_themes", {})))
-        movie_rows = _merge_family_items(pools, family_ids, "movies")
+        movie_rows = _merge_family_items(
+            pools, family_ids, "movies", anchor_rec_families=anchor_rec_families
+        )
         game_rows = _merge_family_items(pools, family_ids, "games")
+        game_rows = _dedupe_game_rows(game_rows)
         if len(movie_rows) < 30 or len(game_rows) < 30:
             fallback = await asyncio.gather(
                 self._archetype_pool(primary, ids), self._archetype_pool(secondary, ids)
@@ -862,13 +1002,13 @@ class RankingService:
         return {
             "movies": _mmr(
                 movies,
-                family_order=family_ids,
+                family_order=families,
                 kind="movie",
                 top_family=family_ids[0] if family_ids else None,
             ),
             "games": _mmr(
                 games,
-                family_order=family_ids,
+                family_order=families,
                 kind="game",
                 top_family=family_ids[0] if family_ids else None,
             ),
@@ -900,8 +1040,24 @@ def _rotated_anchors(anchors: tuple[str, ...], seed: bytes) -> list[str]:
     return list((anchors[offset:] + anchors[:offset])[:4])
 
 
+def _game_anchor_plan(
+    family_id: str, anchors: tuple[str, ...]
+) -> tuple[tuple[str, ...], str | None]:
+    """Return own game anchors or the configured borrowed family anchors."""
+    if anchors:
+        return anchors, None
+    borrowed_from = BORROWED_GAME_FAMILIES.get(family_id)
+    if borrowed_from:
+        return GAME_PROFILES[borrowed_from].anchors, borrowed_from
+    return (), None
+
+
 def _merge_family_items(
-    pools: list[dict[str, Any]], family_ids: list[str], key: str
+    pools: list[dict[str, Any]],
+    family_ids: list[str],
+    key: str,
+    *,
+    anchor_rec_families: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
     for family_id, pool in zip(family_ids, pools, strict=True):
@@ -915,6 +1071,10 @@ def _merge_family_items(
             )
             source_key = f"{'movie' if key == 'movies' else 'game'}:{item_id}"
             source = pool.get("sources", {}).get(source_key, {}).get(family_id, "genre")
+            if source == "anchor_rec" and family_id not in (anchor_rec_families or set()):
+                if not row["sources"]:
+                    found.pop(item_id, None)
+                continue
             current = row["sources"].get(family_id)
             if current is None or _SOURCE_PRIORITY.get(source, 0) > _SOURCE_PRIORITY.get(
                 current, 0
@@ -923,8 +1083,42 @@ def _merge_family_items(
             anchor = pool.get("anchor_names", {}).get(source_key, {}).get(family_id)
             if anchor:
                 row["anchors"][family_id] = anchor
+            borrowed = pool.get("borrowed_names", {}).get(item_id)
+            if borrowed:
+                row.setdefault("borrowed_from", {})[family_id] = borrowed
             row["keywords"][family_id] = pool.get("keywords", {}).get(family_id)
     return list(found.values())
+
+
+def _dedupe_game_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse normalized-name ports, retaining popularity and earliest year."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = row["item"]
+        normalized = normalize_catalog_name(str(item.get("name", "")))
+        key = normalized or str(item.get("id", ""))
+        current = grouped.get(key)
+        if current is None:
+            grouped[key] = row
+            continue
+        old_item = current["item"]
+        old_count = int(old_item.get("total_rating_count", 0) or 0)
+        new_count = int(item.get("total_rating_count", 0) or 0)
+        dates = [
+            float(value)
+            for value in (old_item.get("first_release_date"), item.get("first_release_date"))
+            if value
+        ]
+        winner = row if new_count > old_count else current
+        winner["item"] = dict(winner["item"])
+        if dates:
+            winner["item"]["first_release_date"] = min(dates)
+        for field in ("sources", "shares", "anchors", "keywords", "borrowed_from"):
+            combined = dict(current.get(field, {}))
+            combined.update(row.get(field, {}))
+            winner[field] = combined
+        grouped[key] = winner
+    return list(grouped.values())
 
 
 def _score_candidate(
@@ -955,11 +1149,6 @@ def _score_candidate(
         / denominator
     )
     vibe = (_comparable_cosine(user, title) + 1) / 2
-    quality = _quality(item, kind)
-    fit = 0.5 * (1 - abs(user["era"] - title["era"])) + 0.5 * (
-        1 - abs(user["mainstream"] - title["mainstream"])
-    )
-    score = 0.45 * affinity + 0.20 * vibe + 0.20 * quality + 0.15 * fit
     matched_id = max(
         sources,
         key=lambda family_id: (
@@ -969,6 +1158,21 @@ def _score_candidate(
     )
     matched_id = matched_id or (next(iter(shares)) if shares else "pop")
     matched_source = sources.get(matched_id, "genre")
+    profile = FILM_PROFILES.get(matched_id) if kind == "movie" else None
+    shrinkage = (
+        150
+        if profile and profile.original_languages and profile.anchors
+        else (500 if kind == "movie" else 100)
+    )
+    quality = _quality_with_prior(item, kind, shrinkage)
+    fit = 0.5 * (1 - abs(user["era"] - title["era"])) + 0.5 * (
+        1 - abs(user["mainstream"] - title["mainstream"])
+    )
+    if matched_source == "anchor":
+        fit = 1.0
+        if kind == "movie":
+            quality = float(item.get("vote_average", 0) or 0) / 10
+    score = 0.45 * affinity + 0.20 * vibe + 0.20 * quality + 0.15 * fit
     anchor = row.get("anchors", {}).get(matched_id)
     why = _why(
         matched_id,
@@ -982,6 +1186,7 @@ def _score_candidate(
         or (next(iter(sorted(names)), None) if kind == "game" else None),
         kind=kind,
         language=item.get("original_language"),
+        borrowed_from=row.get("borrowed_from", {}).get(matched_id),
     )
     if kind == "movie":
         title_text = str(item.get("title", ""))
@@ -1014,6 +1219,13 @@ def _score_candidate(
         "matched_family": {"id": matched_id, "label": FAMILY_LABELS.get(matched_id, matched_id)},
         "reason_source": matched_source,
         "original_language": original_language,
+        "_components": {
+            "affinity": affinity,
+            "vibe": vibe,
+            "quality": quality,
+            "fit": fit,
+            "score": score,
+        },
         "_original_language": original_language,
         "_animation_family": bool(names.intersection({"animation", "family"})),
         "_genres": names,
@@ -1024,11 +1236,13 @@ def _source_match(source: str, family_id: str) -> float:
     if source == "anchor":
         return 1.0
     if source == "anchor_rec":
-        return 0.85
+        return 0.35
+    if source == "borrowed_anchor":
+        return 0.6
     if source == "keyword":
         return 0.6
     if source == "language_genre":
-        return 0.6 if family_id == "k-pop" else 0.8
+        return 0.8
     if source == "genre":
         return 0.2
     return 0.0

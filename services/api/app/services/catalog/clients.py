@@ -809,12 +809,15 @@ class CatalogClients:
 
     async def igdb_search_game(self, name: str) -> CatalogResult:
         """Search IGDB for an anchor game and its similar-game IDs."""
-        key = f"igdb:search-game:{name.casefold()}"
+        key = f"igdb:search-game:v2:{name.casefold()}"
         cached = self._cached_ids(key)
         if cached is not None:
             return CatalogResult("search-game", 200, cached)
         escaped = name.replace('"', '\\"')
-        body = f'search "{escaped}"; fields id,name,similar_games; limit 5;'
+        body = (
+            f'search "{escaped}"; fields id,name,alternative_names.name,'
+            "similar_games,total_rating_count; limit 10;"
+        )
         result = await self.igdb_games(body)
         if result.ok and isinstance(result.data, list):
             self.cache.set(key, result.data)

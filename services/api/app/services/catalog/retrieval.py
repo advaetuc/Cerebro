@@ -247,9 +247,13 @@ async def _resolve_keyword(clients: CatalogClients, name: str) -> CatalogResult:
 
 
 def normalize_catalog_name(value: str) -> str:
-    """Casefold a title and remove diacritic marks for exact catalog matching."""
+    """Normalize catalog titles for accent and punctuation-insensitive matching."""
     normalized = unicodedata.normalize("NFKD", value.casefold())
-    return "".join(char for char in normalized if not unicodedata.combining(char))
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    words = re.findall(r"[a-z0-9]+", ascii_text)
+    while words and words[0] in {"the", "a"}:
+        words.pop(0)
+    return " ".join(words)
 
 
 def parse_anchor(anchor: str) -> tuple[str, int | None]:
@@ -272,9 +276,10 @@ def match_tmdb_anchor_result(
     if not result.ok:
         return None
     wanted = normalize_catalog_name(title)
+    matches: list[tuple[int, int, dict[str, Any]]] = []
     for item in _items(result, "results"):
-        actual = str(item.get("title", item.get("original_title", "")))
-        if normalize_catalog_name(actual) != wanted:
+        actual_titles = (item.get("title", ""), item.get("original_title", ""))
+        if wanted not in {normalize_catalog_name(str(value)) for value in actual_titles}:
             continue
         release = str(item.get("release_date", ""))
         try:
@@ -282,8 +287,31 @@ def match_tmdb_anchor_result(
         except ValueError:
             continue
         if year is None or abs(actual_year - year) <= 1:
-            return item
-    return None
+            year_distance = -abs(actual_year - year) if year else 0
+            matches.append((int(item.get("vote_count", 0) or 0), year_distance, item))
+    return max(matches, key=lambda row: (row[0], row[1]))[2] if matches else None
+
+
+GAME_ANCHOR_ALIASES = {
+    "gta san andreas": ("grand theft auto san andreas",),
+    "grand theft auto san andreas": ("gta san andreas",),
+    "def jam fight for ny": ("def jam fight for new york",),
+    "def jam fight for new york": ("def jam fight for ny",),
+    "tony hawks pro skater 2": ("tony hawks pro skater ii",),
+    "tony hawks pro skater ii": ("tony hawks pro skater 2",),
+}
+
+
+def _game_names(item: dict[str, Any]) -> set[str]:
+    """Return normalized IGDB primary and alternative names."""
+    names = {normalize_catalog_name(str(item.get("name", "")))}
+    alternatives = item.get("alternative_names", [])
+    names.update(
+        normalize_catalog_name(str(value.get("name", "")))
+        for value in alternatives
+        if isinstance(value, dict)
+    )
+    return names
 
 
 async def resolve_igdb_anchor(
@@ -294,11 +322,10 @@ async def resolve_igdb_anchor(
     if not result.ok:
         return None, []
     wanted = normalize_catalog_name(anchor)
-    matches = [
-        item
-        for item in _items(result)
-        if normalize_catalog_name(str(item.get("name", ""))) == wanted
-    ]
+    aliases = {normalize_catalog_name(value) for value in GAME_ANCHOR_ALIASES.get(wanted, ())}
+    expected = {wanted, *aliases}
+    matches = [item for item in _items(result) if _game_names(item).intersection(expected)]
+    matches.sort(key=lambda item: int(item.get("total_rating_count", 0) or 0), reverse=True)
     if not matches:
         return None, []
     full = await clients.igdb_games_by_ids(
@@ -313,11 +340,14 @@ def exact_igdb_anchor_matches(result: CatalogResult, anchor: str) -> list[dict[s
     if not result.ok:
         return []
     wanted = normalize_catalog_name(anchor)
-    return [
-        item
-        for item in _items(result)
-        if normalize_catalog_name(str(item.get("name", ""))) == wanted
-    ]
+    aliases = {normalize_catalog_name(value) for value in GAME_ANCHOR_ALIASES.get(wanted, ())}
+    expected = {wanted, *aliases}
+    matches = [item for item in _items(result) if _game_names(item).intersection(expected)]
+    return sorted(
+        matches,
+        key=lambda item: int(item.get("total_rating_count", 0) or 0),
+        reverse=True,
+    )
 
 
 def _keyword_failure(result: CatalogResult) -> str:

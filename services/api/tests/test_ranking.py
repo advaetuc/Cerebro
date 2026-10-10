@@ -7,19 +7,26 @@ import asyncio
 import pytest
 
 from app.services.catalog.clients import CatalogResult, JsonDiskCache
-from app.services.catalog.family_profiles import FILM_PROFILES
+from app.services.catalog.family_profiles import FILM_PROFILES, GAME_PROFILES
 from app.services.catalog.retrieval import (
+    exact_igdb_anchor_matches,
     family_tmdb_query_groups,
     normalize_catalog_name,
     resolve_tmdb_anchor,
 )
 from app.services.ranking import (
+    BORROWED_GAME_FAMILIES,
     RankingService,
+    _allocate_family_slots,
     _article,
+    _dedupe_game_rows,
+    _eligible_anchor_rec,
     _eligible_movie,
+    _game_anchor_plan,
     _merge_family_items,
     _mmr,
     _quality,
+    _quality_with_prior,
     _rotated_anchors,
     _score_candidate,
     _source_match,
@@ -179,6 +186,9 @@ def test_comparable_dimensions_are_the_five_requested() -> None:
     assert _source_match("genre", "hindi-film") == 0.2
     assert _source_match("genre", "hip-hop") == 0.2
     assert _source_match("language_genre", "hindi-film") == 0.8
+    assert _source_match("keyword", "hip-hop") == 0.6
+    assert _source_match("anchor_rec", "hip-hop") == 0.35
+    assert _source_match("borrowed_anchor", "punjabi-pop") == 0.6
     assert _source_match("anchor", "hip-hop") == 1.0
 
 
@@ -299,3 +309,226 @@ def test_anchor_candidates_keep_strongest_provenance() -> None:
     assert len(rows) == 1
     assert rows[0]["sources"]["hip-hop"] == "anchor"
     assert rows[0]["anchors"]["hip-hop"] == "8 Mile"
+
+
+def test_anchor_rec_only_survives_for_allowed_families() -> None:
+    pool = {
+        "movies": [{"id": 42, "title": "Recommendation"}],
+        "sources": {"movie:42": {"hip-hop": "anchor_rec"}},
+    }
+    assert not _merge_family_items([pool], ["hip-hop"], "movies", anchor_rec_families=set())
+    allowed = _merge_family_items([pool], ["hip-hop"], "movies", anchor_rec_families={"hip-hop"})
+    assert allowed[0]["sources"]["hip-hop"] == "anchor_rec"
+
+
+def test_catalog_normalization_aliases_and_duplicate_resolution() -> None:
+    from app.services.catalog.retrieval import match_tmdb_anchor_result
+
+    result = CatalogResult(
+        "search/movie",
+        200,
+        {
+            "results": [
+                {"id": 1, "title": "Gully Boy", "release_date": "2019-01-01", "vote_count": 4},
+                {
+                    "id": 2,
+                    "title": "Gully Boy: The Musical",
+                    "original_title": "Gully Boy",
+                    "release_date": "2020-01-01",
+                    "vote_count": 900,
+                },
+            ]
+        },
+    )
+    assert normalize_catalog_name("  The Tár: A Story! ") == "tar a story"
+    assert match_tmdb_anchor_result(result, "Gully Boy", 2019)["id"] == 2
+    assert normalize_catalog_name("A Fievel's Great Adventure") == "fievel s great adventure"
+
+
+def test_anchor_recommendations_obey_family_filters_and_limit() -> None:
+    candidate = {"vote_average": 7.0, "original_language": "hi", "genre_ids": [1]}
+    assert _eligible_anchor_rec(candidate, ("hi",), set(), {1})
+    assert not _eligible_anchor_rec({**candidate, "vote_average": 6.2}, ("hi",), set(), {1})
+    assert not _eligible_anchor_rec(candidate, ("pa",), set(), {1})
+    assert not _eligible_anchor_rec(candidate, ("hi",), set(), {2})
+    rows = [
+        {
+            "reason_source": "anchor_rec",
+            "score": 0.8,
+            "_genres": {"drama"},
+            "matched_family": {"id": "a"},
+        },
+        {
+            "reason_source": "anchor_rec",
+            "score": 0.7,
+            "_genres": {"crime"},
+            "matched_family": {"id": "a"},
+        },
+        {
+            "reason_source": "anchor_rec",
+            "score": 0.6,
+            "_genres": {"music"},
+            "matched_family": {"id": "a"},
+        },
+        {
+            "reason_source": "genre",
+            "score": 0.5,
+            "_genres": {"comedy"},
+            "matched_family": {"id": "a"},
+        },
+    ]
+    assert sum(item["reason_source"] == "anchor_rec" for item in _mmr(rows, 10)) <= 2
+
+
+def test_family_slots_use_share_thresholds_and_largest_remainder() -> None:
+    shares = [
+        {"id": "a", "share": 0.50},
+        {"id": "b", "share": 0.30},
+        {"id": "c", "share": 0.10},
+        {"id": "d", "share": 0.04},
+    ]
+    rows = [{"matched_family": {"id": family["id"]}} for family in shares for _ in range(10)]
+    slots = _allocate_family_slots(rows, shares, 10)
+    assert slots == {"a": 6, "b": 3, "c": 1}
+    assert "d" not in slots
+
+
+def test_high_share_families_get_direct_anchor_slots() -> None:
+    rows = [
+        {
+            "id": "anchor",
+            "score": 0.1,
+            "_genres": set(),
+            "matched_family": {"id": "a"},
+            "reason_source": "anchor",
+        },
+        {
+            "id": "popular",
+            "score": 0.99,
+            "_genres": set(),
+            "matched_family": {"id": "a"},
+            "reason_source": "genre",
+        },
+        {
+            "id": "b",
+            "score": 0.8,
+            "_genres": set(),
+            "matched_family": {"id": "b"},
+            "reason_source": "genre",
+        },
+    ]
+    picks = _mmr(rows, 2, [{"id": "a", "share": 0.7}, {"id": "b", "share": 0.3}])
+    assert picks[0]["id"] == "anchor"
+    more_anchors = [
+        {
+            "id": f"anchor-{index}",
+            "score": 0.1 + index / 100,
+            "_genres": {str(index)},
+            "matched_family": {"id": "a"},
+            "reason_source": "anchor",
+        }
+        for index in range(2)
+    ] + [
+        {
+            "id": f"genre-{index}",
+            "score": 0.9 - index / 100,
+            "_genres": {f"genre-{index}"},
+            "matched_family": {"id": "a"},
+            "reason_source": "genre",
+        }
+        for index in range(5)
+    ]
+    five_slots = _mmr(more_anchors, 5, [{"id": "a", "share": 1.0}])
+    assert sum(item["reason_source"] == "anchor" for item in five_slots) >= 2
+
+
+def test_family_shrinkage_and_borrowed_anchor_explanation() -> None:
+    expected = (100 * 8 + 150 * 6.5) / (250 * 10)
+    assert _quality_with_prior(
+        {"vote_average": 8, "vote_count": 100}, "movie", 150
+    ) == pytest.approx(expected)
+    assert _source_match("borrowed_anchor", "punjabi-pop") == 0.6
+    text = _why(
+        "punjabi-pop",
+        "borrowed_anchor",
+        "id",
+        set(),
+        _user(),
+        {"energy": 0.5, "valence": 0.5, "tempo": 0.5, "era": 0.5, "mainstream": 0.5},
+        kind="game",
+        borrowed_from="hip-hop",
+    )
+    assert "fans of hip hop" in text.lower()
+    assert BORROWED_GAME_FAMILIES["punjabi-pop"] == "hip-hop"
+    assert BORROWED_GAME_FAMILIES["indian-indie"] == "alt-indie-rock"
+    anchors, borrowed = _game_anchor_plan("punjabi-pop", ())
+    assert anchors == GAME_PROFILES["hip-hop"].anchors
+    assert borrowed == "hip-hop"
+    own_anchors, borrowed = _game_anchor_plan("hip-hop", GAME_PROFILES["hip-hop"].anchors)
+    assert own_anchors == GAME_PROFILES["hip-hop"].anchors
+    assert borrowed is None
+
+
+def test_language_and_anchor_family_uses_150_shrinkage_and_raw_anchor_quality() -> None:
+    item = {"id": 81, "title": "Hindi Film", "vote_average": 8, "vote_count": 100}
+    families = [{"id": "hindi-film", "share": 1.0}]
+    common = (_user(), "Neon Insomniac", families, {}, {}, {}, "https://image/")
+    language_row = {"item": item, "sources": {"hindi-film": "language_genre"}}
+    anchor_row = {"item": item, "sources": {"hindi-film": "anchor"}}
+    language = _score_candidate(language_row, "movie", *common)
+    anchor = _score_candidate(anchor_row, "movie", *common)
+    assert language["_components"]["quality"] == pytest.approx(0.71)
+    assert anchor["_components"]["quality"] == pytest.approx(0.8)
+    assert anchor["_components"]["fit"] == 1.0
+
+
+def test_igdb_anchor_matches_alternative_titles_and_ranks_duplicates() -> None:
+    result = CatalogResult(
+        "games",
+        200,
+        [
+            {
+                "id": 1,
+                "name": "Wrong title",
+                "alternative_names": [{"name": "Def Jam: Fight for New York"}],
+                "total_rating_count": 10,
+            },
+            {
+                "id": 2,
+                "name": "Def Jam Fight for NY",
+                "alternative_names": [],
+                "total_rating_count": 90,
+            },
+        ],
+    )
+    matches = exact_igdb_anchor_matches(result, "Def Jam: Fight for NY")
+    assert [item["id"] for item in matches] == [2, 1]
+
+
+def test_game_ports_dedupe_by_rating_count_and_show_earliest_year() -> None:
+    earlier = 1_262_304_000
+    later = 1_577_836_800
+    rows = [
+        {
+            "item": {
+                "id": 1,
+                "name": "Game: Definitive Edition",
+                "total_rating_count": 20,
+                "first_release_date": later,
+            },
+            "sources": {"a": "genre"},
+        },
+        {
+            "item": {
+                "id": 2,
+                "name": "Game Definitive Edition",
+                "total_rating_count": 50,
+                "first_release_date": earlier,
+            },
+            "sources": {"b": "anchor"},
+        },
+    ]
+    result = _dedupe_game_rows(rows)
+    assert len(result) == 1
+    assert result[0]["item"]["id"] == 2
+    assert result[0]["item"]["first_release_date"] == earlier

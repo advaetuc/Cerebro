@@ -91,20 +91,6 @@ def _print_evaluation(results: list[dict[str, Any]]) -> None:
         if total
         else "source shares | no picks"
     )
-    for profile in results:
-        if profile["id"] not in {"p01", "p02", "p03", "p04", "p05", "p08", "p09"}:
-            continue
-        movies = profile["movies"][:10]
-        languages = [str(item.get("original_language", "")) for item in movies]
-        if profile["id"] in {"p01", "p02", "p03", "p04"}:
-            count = sum(language in {"hi", "pa"} for language in languages)
-            punjabi = sum(language == "pa" for language in languages)
-            print(
-                f"{profile['id']} Hindi/Punjabi movies | {count}/{len(movies)} | Punjabi {punjabi}"
-            )
-        elif profile["id"] == "p08":
-            korean_count = sum(language == "ko" for language in languages)
-            print(f"p08 Korean movies | {korean_count}/{len(movies)}")
     repeated: dict[str, set[str]] = {}
     for profile in results:
         for item in profile["movies"][:5] + profile["games"][:5]:
@@ -115,28 +101,34 @@ def _print_evaluation(results: list[dict[str, Any]]) -> None:
     p01 = by_id.get("p01", {}).get("movies", [])
     p02 = by_id.get("p02", {}).get("movies", [])
     p03_titles = {item["title"].casefold() for item in by_id.get("p03", {}).get("movies", [])}
-    p05 = by_id.get("p05", {}).get("movies", []) + by_id.get("p05", {}).get("games", [])
-    p08_titles = {item["title"].casefold() for item in by_id.get("p08", {}).get("movies", [])}
-    p09_titles = {item["title"].casefold() for item in by_id.get("p09", {}).get("movies", [])}
-    p02_langs = [item.get("original_language") for item in p02]
-    p08_langs = [item.get("original_language") for item in by_id.get("p08", {}).get("movies", [])]
+    p02_rows = p02[:10]
+    p06 = by_id.get("p06", {})
+    p06_shares = {row["id"]: float(row["share"]) for row in p06.get("top_families", [])}
+    p06_picks = p06.get("movies", []) + p06.get("games", [])
+    all_picks = [item for row in results for item in row["movies"] + row["games"]]
+    anchor_rec_count = sum(item.get("reason_source") == "anchor_rec" for item in all_picks)
+    anchor_and_language_count = sum(
+        item.get("reason_source") in {"anchor", "language_genre"} for item in all_picks
+    )
+    denominator = len(all_picks) or 1
     checks = {
-        "p01 >=4/5 Hindi films": sum(item.get("original_language") == "hi" for item in p01[:5])
-        >= 4,
-        "p02 >=2 Hindi/Punjabi films": sum(value in {"hi", "pa"} for value in p02_langs) >= 2,
-        "p02 Punjabi when available": not any(value == "pa" for value in p02_langs)
-        or "pa" in p02_langs,
-        "p03 Gully Boy": any("gully boy" in title for title in p03_titles),
-        "p05 >=3 anchors": sum(
-            item.get("reason_source") in {"anchor", "anchor_rec"} for item in p05
+        "p01 >=4/5 Hindi top-five films": sum(
+            item.get("original_language") == "hi" for item in p01[:5]
         )
-        >= 3,
-        "p08 K-pop film": any("kpop" in title or "blackpink" in title for title in p08_titles),
-        "p08 Korean-language film": any(value == "ko" for value in p08_langs),
-        "p09 Amadeus or Whiplash": any(
-            "amadeus" in title or "whiplash" in title for title in p09_titles
+        >= 4,
+        "p02 >=1 Punjabi top-ten pick": any(
+            item.get("original_language") == "pa"
+            or item.get("matched_family", {}).get("id") == "punjabi-pop"
+            for item in p02_rows
         ),
-        "no title repeated in >=4 top fives": all(len(ids) < 4 for ids in repeated.values()),
+        "p03 Gully Boy top ten": any("gully boy" in title for title in p03_titles),
+        "p06 no picks from families below 0.10": all(
+            p06_shares.get(item.get("matched_family", {}).get("id", ""), 0) >= 0.10
+            for item in p06_picks
+        ),
+        "anchor_rec share <=25%": anchor_rec_count / denominator <= 0.25,
+        "anchor + language_genre share >=50%": anchor_and_language_count / denominator >= 0.5,
+        "no title in top fives of >=3 profiles": all(len(ids) < 3 for ids in repeated.values()),
     }
     for label, passed in checks.items():
         print(f"{'PASS' if passed else 'FAIL'} | {label}")

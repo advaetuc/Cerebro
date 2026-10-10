@@ -122,7 +122,7 @@ class EmptyListeningError(RuntimeError):
     """Represent a private profile or profile without public listening history."""
 
 
-app = FastAPI(title="Cerebro API", version="0.1.0")
+app = FastAPI(title="Cerebro API", version="0.2.0")
 app.add_middleware(CORSMiddleware, **cors_settings())
 app.state.analysis_guard = AnalysisGuard()
 app.state.analyze_cache = {}
