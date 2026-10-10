@@ -201,22 +201,12 @@ def tmdb_backoff_delay(
 
 
 def select_keyword_match(results: list[dict[str, Any]], keyword: str) -> dict[str, Any] | None:
-    """Choose exact-name match, otherwise the highest-ranked search result."""
+    """Return only a case-insensitive exact keyword-name match."""
     wanted = keyword.strip().casefold()
     for result in results:
         if str(result.get("name", "")).strip().casefold() == wanted:
             return result
-    if not results:
-        return None
-
-    def score(item: dict[str, Any]) -> tuple[float, int]:
-        try:
-            rank = float(item.get("score", 0))
-        except (TypeError, ValueError):
-            rank = 0.0
-        return rank, -results.index(item)
-
-    return max(results, key=score)
+    return None
 
 
 def _warm_copy(result: CatalogResult) -> CatalogResult:
@@ -819,22 +809,36 @@ class CatalogClients:
 
     async def igdb_search_game(self, name: str) -> CatalogResult:
         """Search IGDB for an anchor game and its similar-game IDs."""
+        key = f"igdb:search-game:{name.casefold()}"
+        cached = self._cached_ids(key)
+        if cached is not None:
+            return CatalogResult("search-game", 200, cached)
         escaped = name.replace('"', '\\"')
-        body = (
-            f'search "{escaped}"; fields id,name,similar_games; limit 5; '
-            "where total_rating_count >= 100 & total_rating >= 65;"
-        )
-        return await self.igdb_games(body)
+        body = f'search "{escaped}"; fields id,name,similar_games; limit 5;'
+        result = await self.igdb_games(body)
+        if result.ok and isinstance(result.data, list):
+            self.cache.set(key, result.data)
+        return result
 
-    async def igdb_games_by_ids(self, ids: list[int]) -> CatalogResult:
+    async def igdb_games_by_ids(
+        self,
+        ids: list[int],
+        *,
+        rating_count_floor: int | None = 100,
+        rating_floor: int | None = 65,
+    ) -> CatalogResult:
         """Fetch full candidate records for similar-game IDs."""
         if not ids:
             return CatalogResult("games", 200, [])
+        clauses = [f"id = ({','.join(map(str, ids))})"]
+        if rating_count_floor is not None:
+            clauses.append(f"total_rating_count >= {rating_count_floor}")
+        if rating_floor is not None:
+            clauses.append(f"total_rating >= {rating_floor}")
         body = (
             "fields id,name,first_release_date,total_rating,total_rating_count,"
-            "genres,themes,cover; "
-            f"where id = ({','.join(map(str, ids))}) & total_rating_count >= 100 "
-            "& total_rating >= 65; limit 40; sort total_rating desc;"
+            "genres,themes,cover.image_id; "
+            f"where {' & '.join(clauses)}; limit 40; sort total_rating desc;"
         )
         return await self.igdb_games(body)
 

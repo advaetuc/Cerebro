@@ -32,8 +32,11 @@ from app.services.catalog.retrieval import (
     _igdb_query_bodies,
     _items,
     _prepare,
+    exact_igdb_anchor_matches,
     family_igdb_bodies,
     family_tmdb_query_groups,
+    match_tmdb_anchor_result,
+    parse_anchor,
 )
 from app.services.vibe.archetypes import ARCHETYPES, POPULATION_MEAN, POPULATION_STD
 from app.services.vibe.genre_priors import DIMENSIONS
@@ -108,6 +111,7 @@ DIM_PHRASES = {
     "mainstream": ("left-of-center", "crowd-pleasing"),
 }
 _SOURCE_TEMPLATES = {
+    "anchor": ("A touchstone of {family} on screen.", "A defining {family} touchstone on screen."),
     "anchor_rec": (
         "For {family} listeners: recommended alongside {anchor}.",
         "{anchor} points {family} listeners toward this pick.",
@@ -116,8 +120,12 @@ _SOURCE_TEMPLATES = {
         "Matches your {family} listening through its {keyword} themes.",
         "Its {keyword} themes connect with your {family} listening.",
     ),
+    "language_genre": (
+        "Popular {language} cinema for {family} listeners.",
+        "A {language} film selection for {family} listeners.",
+    ),
     "genre": (
-        "A {genre} pick that fits the {p1}, {p2} mood of your listening.",
+        "{article}{genre} pick that fits the {p1}, {p2} mood of your listening.",
         "Your {p1}, {p2} taste finds a match in this {genre} pick.",
     ),
 }
@@ -180,6 +188,40 @@ def _year_fraction(value: Any) -> float | None:
     return _clamp((year - 1950) / 70)
 
 
+def _eligible_movie(
+    item: dict[str, Any],
+    languages: tuple[str, ...],
+    excludes: set[Any],
+    genres: set[Any],
+    vote_floor: int,
+    require_genre: bool = True,
+) -> bool:
+    if int(item.get("vote_count", 0) or 0) < vote_floor:
+        return False
+    if languages and item.get("original_language") not in languages:
+        return False
+    item_genres = set(item.get("genre_ids", []))
+    return not item_genres.intersection(excludes) and (
+        not require_genre or bool(item_genres.intersection(genres))
+    )
+
+
+def _set_source(sources: dict[str, dict[str, str]], key: str, family_id: str, source: str) -> None:
+    family_sources = sources.setdefault(key, {})
+    current = family_sources.get(family_id)
+    if current is None or _SOURCE_PRIORITY.get(source, 0) > _SOURCE_PRIORITY.get(current, 0):
+        family_sources[family_id] = source
+
+
+_SOURCE_PRIORITY = {
+    "genre": 1,
+    "keyword": 2,
+    "language_genre": 3,
+    "anchor_rec": 4,
+    "anchor": 5,
+}
+
+
 def _title_vector(
     item: dict[str, Any],
     kind: str,
@@ -225,11 +267,21 @@ def _why(
     title: dict[str, float],
     anchor: str | None = None,
     keyword: str | None = None,
+    kind: str = "movie",
+    language: str | None = None,
 ) -> str:
     family = FAMILY_LABELS.get(family_id, family_id.replace("-", " ").title())
     chosen = int.from_bytes(hashlib.sha256(item_id.encode()).digest()[:4], "big")
     source = source if source in _SOURCE_TEMPLATES else "genre"
     templates = _SOURCE_TEMPLATES[source]
+    if source == "anchor":
+        template = templates[chosen % len(templates)].format(family=family)
+        return template.replace("on screen", "in games") if kind == "game" else template
+    if source == "language_genre":
+        language_label = {"hi": "Hindi", "pa": "Punjabi", "ko": "Korean"}.get(
+            language or "", "regional"
+        )
+        return templates[chosen % len(templates)].format(family=family, language=language_label)
     if source == "anchor_rec":
         return templates[chosen % len(templates)].format(
             family=family, anchor=anchor or "a related title"
@@ -240,6 +292,7 @@ def _why(
         )
         return templates[chosen % len(templates)].format(family=family, keyword=term or "genre")
     genre = next(iter(sorted(names)), "genre")
+    article = _article(genre)
     agreement = sorted(
         (
             (abs(_zscore(user[dim], dim)) + abs(_zscore(title[dim], dim)), dim)
@@ -250,16 +303,22 @@ def _why(
     phrases = []
     for _, dim in agreement:
         left, right = _zscore(user[dim], dim), _zscore(title[dim], dim)
-        if left * right > 0:
+        if left * right > 0 and abs(left) >= 0.3 and abs(right) >= 0.3:
             phrases.append(DIM_PHRASES[dim][1 if left > 0 else 0])
         if len(phrases) == 2:
             break
-    for fallback_phrase in ("slow-burning", "moody"):
-        if len(phrases) >= 2:
-            break
-        if fallback_phrase not in phrases:
-            phrases.append(fallback_phrase)
-    return templates[chosen % len(templates)].format(genre=genre, p1=phrases[0], p2=phrases[1])
+    if not phrases:
+        return "Close to the sound of your top genres."
+    if len(phrases) == 1:
+        phrases.append(phrases[0])
+    return templates[chosen % len(templates)].format(
+        article=article, genre=genre, p1=phrases[0], p2=phrases[1]
+    )
+
+
+def _article(value: str) -> str:
+    """Return the correct indefinite article for a short genre phrase."""
+    return "An " if value[:1].casefold() in "aeiou" else "A "
 
 
 def _explanation(user: dict[str, float], title: dict[str, float], title_id: str) -> str:
@@ -297,6 +356,8 @@ def _mmr(
     candidates: list[dict[str, Any]],
     limit: int = TOP_K,
     family_order: list[str] | None = None,
+    kind: str = "movie",
+    top_family: str | None = None,
 ) -> list[dict[str, Any]]:
     """Select family coverage first, then diversify remaining genre sets."""
     selected: list[dict[str, Any]] = []
@@ -306,29 +367,56 @@ def _mmr(
         for candidate in candidates
         if candidate.get("matched_family")
     }
-    ordered_ids = family_order or list(dict.fromkeys(
-        candidate.get("matched_family", {}).get("id")
-        for candidate in candidates
-        if candidate.get("matched_family")
-    ))
+    ordered_ids = family_order or list(
+        dict.fromkeys(
+            candidate.get("matched_family", {}).get("id")
+            for candidate in candidates
+            if candidate.get("matched_family")
+        )
+    )
     quotas = {
-        family_id: 2 if index == 0 else 1
+        family_id: 3 if index == 0 else (2 if index == 1 else 1)
         for index, family_id in enumerate(ordered_ids[:3])
         if family_id in present_ids
     }
+    if limit < 6 and len(quotas) > 1:
+        for index, family_id in enumerate(quotas):
+            quotas[family_id] = max(1, limit - (len(quotas) - 1)) if index == 0 else 1
     for family_id, quota in quotas.items():
         for _ in range(quota):
             options = [
                 item for item in remaining if item.get("matched_family", {}).get("id") == family_id
             ]
+            profile = FILM_PROFILES.get(family_id) if kind == "movie" else None
+            if profile and profile.original_languages:
+                required = math.ceil(quota * 0.6)
+                language_picks = sum(
+                    item.get("matched_family", {}).get("id") == family_id
+                    and item.get("reason_source") == "language_genre"
+                    for item in selected
+                )
+                if language_picks < required:
+                    language_options = [
+                        item
+                        for item in options
+                        if item.get("_original_language") in profile.original_languages
+                    ]
+                    if language_options:
+                        options = language_options
             if not options or len(selected) >= limit:
+                break
+            options = _selection_filtered(options, selected, kind, top_family)
+            if not options:
                 break
             pick = max(options, key=lambda item: item["score"])
             selected.append(pick)
             remaining.remove(pick)
     while remaining and len(selected) < limit:
+        options = _selection_filtered(remaining, selected, kind, top_family)
+        if not options:
+            break
         pick = max(
-            remaining,
+            options,
             key=lambda item: (
                 MMR_LAMBDA * item["score"]
                 - (1 - MMR_LAMBDA)
@@ -355,6 +443,58 @@ def _mmr(
     return picks
 
 
+def _selection_filtered(
+    items: list[dict[str, Any]], selected: list[dict[str, Any]], kind: str, top_family: str | None
+) -> list[dict[str, Any]]:
+    candidates = items
+    if kind == "movie":
+        if top_family not in {"pop", "k-pop", "electropop", "disco-dance", "soundtrack"}:
+            animated = sum(bool(item.get("_animation_family")) for item in selected)
+            if animated >= 2:
+                candidates = [item for item in candidates if not item.get("_animation_family")]
+        genre_only = sum(item.get("reason_source") == "genre" for item in selected)
+        if genre_only >= 2:
+            candidates = [item for item in candidates if item.get("reason_source") != "genre"]
+        language_candidates = []
+        for item in candidates:
+            family_id = item.get("matched_family", {}).get("id")
+            profile = FILM_PROFILES.get(family_id)
+            if not profile or not profile.original_languages:
+                language_candidates.append(item)
+                continue
+            family_selected = [
+                row for row in selected if row.get("matched_family", {}).get("id") == family_id
+            ]
+            matching_pool = [
+                row
+                for row in items
+                if row.get("matched_family", {}).get("id") == family_id
+                and row.get("_original_language") in profile.original_languages
+            ]
+            is_language = item.get("_original_language") in profile.original_languages
+            if (
+                len(matching_pool) > len(family_selected)
+                and (
+                    sum(
+                        row.get("_original_language") in profile.original_languages
+                        for row in family_selected
+                    )
+                    + int(is_language)
+                )
+                / (len(family_selected) + 1)
+                >= 0.6
+            ):
+                language_candidates.append(item)
+            elif not matching_pool:
+                language_candidates.append(item)
+        candidates = language_candidates
+    else:
+        genre_only = sum(item.get("reason_source") == "genre" for item in selected)
+        if genre_only >= 2:
+            candidates = [item for item in candidates if item.get("reason_source") != "genre"]
+    return candidates
+
+
 class RankingService:
     """Retrieve cached family pools, score candidates, and diversify picks."""
 
@@ -373,22 +513,27 @@ class RankingService:
         self._memory: dict[str, tuple[float, dict[str, Any]]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def _family_pool(self, family_id: str, ids: dict[str, Any]) -> dict[str, Any]:
-        lock = self._locks.setdefault(f"family:{family_id}", asyncio.Lock())
+    async def _family_pool(
+        self, family_id: str, ids: dict[str, Any], anchor_seed: bytes | None = None
+    ) -> dict[str, Any]:
+        anchor_seed = anchor_seed or b"default"
+        anchor_key = hashlib.sha256(anchor_seed).hexdigest()[:10]
+        cache_key = f"{family_id}:{anchor_key}"
+        lock = self._locks.setdefault(f"family:{cache_key}", asyncio.Lock())
         async with lock:
             now = time.time()
-            cached = self._memory.get(family_id)
+            cached = self._memory.get(cache_key)
             if cached and cached[0] > now:
                 return cached[1]
-            key = f"family-pool:{family_id}"
+            key = f"family-pool:{cache_key}"
             fresh = self.disk_cache.get(key)
             if isinstance(fresh, dict):
-                self._memory[family_id] = (now + self.ttl_seconds, fresh)
+                self._memory[cache_key] = (now + self.ttl_seconds, fresh)
                 return fresh
             stale_getter = getattr(self.disk_cache, "get_stale", None)
             stale = stale_getter(key) if stale_getter else None
             try:
-                pool = await self._retrieve_family(family_id, ids)
+                pool = await self._retrieve_family(family_id, ids, anchor_seed)
             except ConfigError:
                 raise
             except Exception as exc:
@@ -422,18 +567,20 @@ class RankingService:
                     logger.warning("serving stale catalog pool family=%s", family_id)
             if not stale_served and not pool.get("error"):
                 self.disk_cache.set(key, pool)
-            self._memory[family_id] = (now + self.ttl_seconds, pool)
+            self._memory[cache_key] = (now + self.ttl_seconds, pool)
             return pool
 
-    async def _retrieve_family(self, family_id: str, ids: dict[str, Any]) -> dict[str, Any]:
+    async def _retrieve_family(
+        self, family_id: str, ids: dict[str, Any], anchor_seed: bytes | None = None
+    ) -> dict[str, Any]:
         film = FILM_PROFILES[family_id]
         game = GAME_PROFILES[family_id]
+        anchor_seed = anchor_seed or b"default"
+        film_anchors = _rotated_anchors(film.anchors, anchor_seed)
+        game_anchors = _rotated_anchors(game.anchors, anchor_seed)
         movie_query_groups = family_tmdb_query_groups(film, ids)
         movie_tasks = [self.clients.tmdb_discover(query) for _, query in movie_query_groups]
-        anchor_specs = [
-            self.clients.tmdb_search_movie(*_anchor_parts(anchor)) for anchor in film.anchors
-        ]
-        movie_calls = await asyncio.gather(*movie_tasks, *anchor_specs, return_exceptions=True)
+        movie_calls = await asyncio.gather(*movie_tasks, return_exceptions=True)
         movie_results = [value for value in movie_calls if isinstance(value, CatalogResult)]
         retrieval_degraded = any(not isinstance(value, CatalogResult) for value in movie_calls)
         for value in movie_calls:
@@ -445,6 +592,11 @@ class RankingService:
         movie_items: dict[str, dict[str, Any]] = {}
         sources: dict[str, dict[str, str]] = {}
         anchor_names: dict[str, dict[str, str]] = {}
+        genre_names = {name.casefold() for name in film.tmdb_genres}
+        genre_ids = {ids.get("tmdb_genres", {}).get(name) for name in genre_names}
+        exclude_ids = {
+            ids.get("tmdb_genres", {}).get(name.casefold()) for name in film.exclude_genres
+        }
         for source, query_result in zip(
             [source for source, _ in movie_query_groups],
             movie_calls[: len(movie_tasks)],
@@ -455,29 +607,48 @@ class RankingService:
             result = query_result
             for item in _items(result, "results"):
                 if item.get("id") is not None:
+                    if source == "language_genre" and not _eligible_movie(
+                        item, film.original_languages, exclude_ids, genre_ids, 100
+                    ):
+                        continue
+                    if source in {"genre", "keyword"} and not _eligible_movie(
+                        item, (), exclude_ids, genre_ids, 500 if source == "keyword" else 300
+                    ):
+                        continue
                     key = str(item["id"])
                     movie_items.setdefault(key, item)
-                    sources.setdefault(f"movie:{key}", {})[family_id] = source
-        for anchor, result in zip(film.anchors, movie_calls[len(movie_tasks) :], strict=False):
-            if not isinstance(result, CatalogResult):
-                continue
-            matches = _items(result, "results")
-            if not matches:
-                continue
-            anchor_id = matches[0].get("id")
-            if anchor_id is None:
-                continue
-            recommendation = await self.clients.tmdb_movie_recommendations(int(anchor_id))
-            if not recommendation.ok:
-                _log_failure("TMDB", recommendation)
+                    _set_source(sources, f"movie:{key}", family_id, source)
+        unresolved_anchors: list[str] = []
+        for anchor in film_anchors:
+            title, year = parse_anchor(anchor)
+            anchor_search = await self.clients.tmdb_search_movie(title)
+            anchor_item = match_tmdb_anchor_result(anchor_search, title, year)
+            if not anchor_search.ok:
+                _log_failure("TMDB", anchor_search)
                 retrieval_degraded = True
-            for item in _items(recommendation, "results"):
-                if item.get("id") is not None:
+            if not anchor_item:
+                unresolved_anchors.append(anchor)
+                continue
+            anchor_id = anchor_item.get("id")
+            if anchor_id is not None:
+                key = str(anchor_id)
+                movie_items[key] = anchor_item
+                _set_source(sources, f"movie:{key}", family_id, "anchor")
+                anchor_names.setdefault(f"movie:{key}", {})[family_id] = anchor.split(" (", 1)[0]
+                recommendation = await self.clients.tmdb_movie_recommendations(int(anchor_id))
+                if not recommendation.ok:
+                    _log_failure("TMDB", recommendation)
+                    retrieval_degraded = True
+                for item in _items(recommendation, "results"):
+                    if not _eligible_movie(
+                        item, film.original_languages, exclude_ids, genre_ids, 100, False
+                    ):
+                        continue
                     key = str(item["id"])
                     movie_items.setdefault(key, item)
                     source_key = f"movie:{key}"
-                    sources.setdefault(source_key, {})[family_id] = "anchor_rec"
-                    anchor_names.setdefault(source_key, {})[family_id] = anchor.rsplit(" (", 1)[0]
+                    _set_source(sources, source_key, family_id, "anchor_rec")
+                    anchor_names.setdefault(source_key, {})[family_id] = anchor.split(" (", 1)[0]
         game_bodies = family_igdb_bodies(game, ids)
         game_results = await asyncio.gather(
             *(self.clients.igdb_games(body) for body in game_bodies), return_exceptions=True
@@ -492,64 +663,99 @@ class RankingService:
             if isinstance(result, CatalogResult) and not result.ok:
                 _log_failure("IGDB", result)
         game_items: dict[str, dict[str, Any]] = {}
+        game_theme_ids = {
+            ids.get("igdb_themes", {}).get(name.casefold()) for name in game.igdb_themes
+        }
         for result in game_results:
             if not isinstance(result, CatalogResult):
                 continue
             for item in _items(result):
                 if item.get("id") is not None:
                     key = str(item["id"])
+                    item_themes = {
+                        value.get("id")
+                        for value in item.get("themes", [])
+                        if isinstance(value, dict)
+                    }
+                    if not item_themes.intersection(game_theme_ids):
+                        continue
                     game_items.setdefault(key, item)
                     source = "genre"
-                    family_sources = sources.setdefault(f"game:{key}", {})
-                    if family_id not in family_sources:
-                        family_sources[family_id] = source
-        for anchor in game.anchors:
+                    _set_source(sources, f"game:{key}", family_id, source)
+        for anchor in game_anchors:
             search = await self.clients.igdb_search_game(anchor)
             if not search.ok:
                 _log_failure("IGDB", search)
                 retrieval_degraded = True
-            for record in _items(search):
-                similar = record.get("similar_games", [])
-                if not isinstance(similar, list):
-                    continue
+            search_matches = exact_igdb_anchor_matches(search, anchor)
+            candidate = None
+            if search_matches:
+                detail = await self.clients.igdb_games_by_ids(
+                    [int(search_matches[0]["id"])],
+                    rating_count_floor=None,
+                    rating_floor=None,
+                )
+                if not detail.ok:
+                    _log_failure("IGDB", detail)
+                    retrieval_degraded = True
+                else:
+                    candidate = next(iter(_items(detail)), None)
+            if not candidate:
+                unresolved_anchors.append(anchor)
+                continue
+            candidate_id = candidate.get("id")
+            if candidate_id is not None:
+                key = str(candidate_id)
+                game_items[key] = candidate
+                _set_source(sources, f"game:{key}", family_id, "anchor")
+            similar = search_matches[0].get("similar_games", []) if search_matches else []
+            if similar:
                 result = await self.clients.igdb_games_by_ids(
-                    [int(value) for value in similar[:40]]
+                    [int(value) for value in similar[:40]], rating_count_floor=50, rating_floor=None
                 )
                 if not result.ok:
                     _log_failure("IGDB", result)
                     retrieval_degraded = True
                 for item in _items(result):
-                    if item.get("id") is not None:
-                        key = str(item["id"])
-                        game_items.setdefault(key, item)
-                        source_key = f"game:{key}"
-                        sources.setdefault(source_key, {})[family_id] = "anchor_rec"
-                        anchor_names.setdefault(source_key, {})[family_id] = anchor
-        failed_movies = not any(result.ok for result in movie_results)
-        failed_games = not any(
+                    if item.get("id") is None or int(item.get("total_rating_count", 0) or 0) < 50:
+                        continue
+                    key = str(item["id"])
+                    game_items.setdefault(key, item)
+                    _set_source(sources, f"game:{key}", family_id, "anchor_rec")
+                    anchor_names.setdefault(f"game:{key}", {})[family_id] = anchor
+        failed_movies = not movie_items and not any(result.ok for result in movie_results)
+        failed_games = not game_items and not any(
             isinstance(result, CatalogResult) and result.ok for result in game_results
         )
-        unresolved_keywords = [
-            name
+        degraded_reasons = [f"Unresolved anchor: {name}" for name in unresolved_anchors]
+        keyword_errors = ids.get("unresolved_keywords", {})
+        degraded_reasons.extend(
+            f"TMDB keyword {name}: {error}"
             for name in film.tmdb_keywords
-            if ids.get("tmdb_keywords", {}).get(name.casefold()) is None
-        ]
-        keyword_reasons = ids.get("unresolved_keywords", {})
-        degraded_reasons = [
-            f"TMDB keyword {name}: {keyword_reasons.get(name, 'no_match')}"
-            for name in unresolved_keywords
-        ]
+            if (error := keyword_errors.get(name))
+        )
         return {
             "movies": list(movie_items.values()),
             "games": list(game_items.values()),
             "sources": sources,
             "anchor_names": anchor_names,
+            "keywords": {
+                family_id: next(
+                    (
+                        name
+                        for name in film.tmdb_keywords
+                        if ids.get("tmdb_keywords", {}).get(name.casefold()) is not None
+                    ),
+                    None,
+                )
+            },
+            "unresolved_anchors": unresolved_anchors,
             "error": failed_movies and failed_games,
             "movies_failed": failed_movies,
             "games_failed": failed_games,
             "degraded_reasons": degraded_reasons,
             "degraded": retrieval_degraded
-            or bool(degraded_reasons)
+            or bool(keyword_errors)
             or any(not item.ok for item in movie_results)
             or any(not isinstance(item, CatalogResult) or not item.ok for item in game_results),
         }
@@ -594,20 +800,20 @@ class RankingService:
         igdb_genres: list[dict[str, Any]] | None = None,
         igdb_themes: list[dict[str, Any]] | None = None,
         top_families: list[dict[str, Any]] | None = None,
+        top_artist_names: list[str] | None = None,
     ) -> dict[str, Any]:
         """Return top recommendations based on the user's strongest families."""
         ids = await _prepare(self.clients)
-        for result in ids.get("boot_results", []):
-            if hasattr(result, "ok") and not result.ok and "search/keyword:" not in result.endpoint:
-                provider = "TMDB" if result.endpoint.startswith(("genre/", "search/")) else "IGDB"
-                _log_failure(provider, result)
         families = [item for item in (top_families or []) if float(item.get("share", 0)) >= 0.08][
             :4
         ]
         if not families:
             families = [{"id": family, "share": 1 / 3} for family in list(FILM_PROFILES)[:3]]
         family_ids = [str(item["id"]) for item in families if item.get("id") in FILM_PROFILES]
-        pools = await asyncio.gather(*(self._family_pool(fid, ids) for fid in family_ids))
+        artist_hash = hashlib.sha256("|".join(sorted(top_artist_names or [])).encode()).digest()
+        pools = await asyncio.gather(
+            *(self._family_pool(fid, ids, artist_hash) for fid in family_ids)
+        )
         configuration = await self.clients.tmdb_configuration()
         if not configuration.ok:
             _log_failure("TMDB", configuration)
@@ -654,8 +860,18 @@ class RankingService:
         if not configuration.ok:
             degraded_reasons.add("TMDB image configuration unavailable")
         return {
-            "movies": _mmr(movies, family_order=family_ids),
-            "games": _mmr(games, family_order=family_ids),
+            "movies": _mmr(
+                movies,
+                family_order=family_ids,
+                kind="movie",
+                top_family=family_ids[0] if family_ids else None,
+            ),
+            "games": _mmr(
+                games,
+                family_order=family_ids,
+                kind="game",
+                top_family=family_ids[0] if family_ids else None,
+            ),
             "degraded": any(pool.get("degraded") for pool in pools) or not configuration.ok,
             "upstream_error": unavailable_movie and unavailable_game,
             "failed_providers": [
@@ -677,6 +893,13 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _rotated_anchors(anchors: tuple[str, ...], seed: bytes) -> list[str]:
+    if not anchors:
+        return []
+    offset = int.from_bytes(seed[:4], "big") % len(anchors)
+    return list((anchors[offset:] + anchors[:offset])[:4])
+
+
 def _merge_family_items(
     pools: list[dict[str, Any]], family_ids: list[str], key: str
 ) -> list[dict[str, Any]]:
@@ -687,15 +910,20 @@ def _merge_family_items(
             if not item_id:
                 continue
             row = found.setdefault(
-                item_id, {"item": item, "sources": {}, "shares": {}, "anchors": {}}
+                item_id,
+                {"item": item, "sources": {}, "shares": {}, "anchors": {}, "keywords": {}},
             )
             source_key = f"{'movie' if key == 'movies' else 'game'}:{item_id}"
-            row["sources"][family_id] = (
-                pool.get("sources", {}).get(source_key, {}).get(family_id, "genre")
-            )
-            row["anchors"][family_id] = (
-                pool.get("anchor_names", {}).get(source_key, {}).get(family_id)
-            )
+            source = pool.get("sources", {}).get(source_key, {}).get(family_id, "genre")
+            current = row["sources"].get(family_id)
+            if current is None or _SOURCE_PRIORITY.get(source, 0) > _SOURCE_PRIORITY.get(
+                current, 0
+            ):
+                row["sources"][family_id] = source
+            anchor = pool.get("anchor_names", {}).get(source_key, {}).get(family_id)
+            if anchor:
+                row["anchors"][family_id] = anchor
+            row["keywords"][family_id] = pool.get("keywords", {}).get(family_id)
     return list(found.values())
 
 
@@ -750,7 +978,10 @@ def _score_candidate(
         user,
         title,
         anchor,
-        next(iter(sorted(names)), None) if kind == "game" else None,
+        row.get("keywords", {}).get(matched_id)
+        or (next(iter(sorted(names)), None) if kind == "game" else None),
+        kind=kind,
+        language=item.get("original_language"),
     )
     if kind == "movie":
         title_text = str(item.get("title", ""))
@@ -758,6 +989,7 @@ def _score_candidate(
         poster = item.get("poster_path")
         image = f"{image_base}w342{poster}" if poster else None
         source_url = f"https://www.themoviedb.org/movie/{item.get('id')}"
+        original_language = item.get("original_language")
     else:
         title_text = str(item.get("name", ""))
         released = item.get("first_release_date")
@@ -770,6 +1002,7 @@ def _score_candidate(
             else None
         )
         source_url = f"https://www.igdb.com/games/{item.get('id')}"
+        original_language = None
     return {
         "id": str(item.get("id", "")),
         "title": title_text,
@@ -780,19 +1013,25 @@ def _score_candidate(
         "source_url": source_url,
         "matched_family": {"id": matched_id, "label": FAMILY_LABELS.get(matched_id, matched_id)},
         "reason_source": matched_source,
+        "original_language": original_language,
+        "_original_language": original_language,
+        "_animation_family": bool(names.intersection({"animation", "family"})),
         "_genres": names,
     }
 
 
 def _source_match(source: str, family_id: str) -> float:
-    if source == "anchor_rec":
+    if source == "anchor":
         return 1.0
+    if source == "anchor_rec":
+        return 0.85
     if source == "keyword":
-        return 0.7
-    if source in {"language", "genre_language"}:
-        return 0.5
-    profile = FILM_PROFILES.get(family_id)
-    return 0.5 if profile and profile.original_languages else 0.3
+        return 0.6
+    if source == "language_genre":
+        return 0.6 if family_id == "k-pop" else 0.8
+    if source == "genre":
+        return 0.2
+    return 0.0
 
 
 def _log_failure(provider: str, result: CatalogResult) -> None:

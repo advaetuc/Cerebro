@@ -598,6 +598,7 @@ async def analyze(
         ranked = await ranker.rank(
             vibe["vector"], vibe["primary"], vibe["secondary"],
             top_families=vibe["top_families"],
+            top_artist_names=[artist.name for artist in artist_inputs],
         )
         if ranked.get("upstream_error"):
             provider = "/".join(ranked.get("failed_providers", ["TMDB/IGDB"]))

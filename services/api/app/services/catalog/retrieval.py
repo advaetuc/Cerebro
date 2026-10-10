@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import statistics
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,8 @@ SPIKE_DIR = Path(__file__).resolve().parents[3] / "spike"
 BLUEPRINT_PATH = SPIKE_DIR.parents[2] / "docs" / "cerebro_blueprint.md"
 REPORT_PATH = SPIKE_DIR / "out" / "catalog_report.json"
 logger = logging.getLogger("cerebro.upstream")
+_NO_MATCH_LOGGED: set[str] = set()
+_BOOT_FAILURE_LOGGED: set[tuple[str, str, str]] = set()
 
 INTENTS: dict[str, dict[str, Any]] = {
     "Neon Insomniac": {
@@ -80,15 +84,6 @@ INTENTS: dict[str, dict[str, Any]] = {
     },
 }
 
-KEYWORD_SYNONYMS = {
-    "coming of age": ("coming-of-age", "teenager"),
-    "road movie": ("road trip",),
-    "retro futurism": ("retrofuturism", "retro-futuristic"),
-    "rhythm": ("music", "dance"),
-    "survival": ("survival horror", "wilderness"),
-    "romance": ("love", "romantic comedy"),
-}
-
 
 def _items(result: CatalogResult, key: str | None = None) -> list[dict[str, Any]]:
     payload = result.data
@@ -109,6 +104,9 @@ def _name_ids(items: list[dict[str, Any]]) -> dict[str, int]:
 
 async def _prepare(clients: CatalogClients) -> dict[str, Any]:
     """Resolve every catalog name before retrieval timing begins."""
+    cached = getattr(clients, "_family_prepared_ids", None)
+    if isinstance(cached, dict):
+        return cached
     keyword_names = sorted(
         {name for intent in INTENTS.values() for name in intent["tmdb_keywords"]}
         | {name for profile in FILM_PROFILES.values() for name in profile.tmdb_keywords}
@@ -120,10 +118,8 @@ async def _prepare(clients: CatalogClients) -> dict[str, Any]:
         *(_resolve_keyword(clients, name) for name in keyword_names),
     )
     keyword_results = dict(zip(keyword_names, keywords, strict=True))
-    unresolved = {
-        name: _keyword_failure(result) for name, result in keyword_results.items() if not result.ok
-    }
-    return {
+    unresolved = _keyword_errors(keyword_results)
+    prepared = {
         "tmdb_genres": _name_ids(_items(tmdb_genres, "genres")) if tmdb_genres.ok else {},
         "tmdb_keywords": {
             name.casefold(): (
@@ -143,10 +139,26 @@ async def _prepare(clients: CatalogClients) -> dict[str, Any]:
         "igdb_themes": _name_ids(_items(igdb_themes)) if igdb_themes.ok else {},
         "boot_results": [tmdb_genres, igdb_genres, igdb_themes, *keywords],
     }
+    for result in (tmdb_genres, igdb_genres, igdb_themes):
+        if result.ok:
+            continue
+        provider = "TMDB" if result.endpoint.startswith("genre/") else "IGDB"
+        identity = (provider, result.endpoint, str(result.error_code))
+        if identity in _BOOT_FAILURE_LOGGED:
+            continue
+        _BOOT_FAILURE_LOGGED.add(identity)
+        logger.warning(
+            "upstream failure provider=%s endpoint=%s error=%s",
+            provider,
+            result.endpoint,
+            redact_secrets(result.error_detail or result.error_message or "upstream failure")[:120],
+        )
+    clients._family_prepared_ids = prepared
+    return prepared
 
 
 def family_tmdb_query_groups(profile: Any, ids: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """Build separate genre and keyword OR queries with provenance labels."""
+    """Build language, keyword, and genre queries with provenance labels."""
     genres = [
         ids["tmdb_genres"][name.casefold()]
         for name in profile.tmdb_genres
@@ -162,21 +174,22 @@ def family_tmdb_query_groups(profile: Any, ids: dict[str, Any]) -> list[tuple[st
         for name in profile.exclude_genres
         if name.casefold() in ids["tmdb_genres"]
     ]
-    groups = [("genre", genres)] if genres else []
-    groups.extend([("keyword", keywords)] if keywords else [])
     output = []
-    for source, values in groups:
+    query_groups: list[tuple[str, list[int], list[int], str | None, int]] = []
+    for language in profile.original_languages:
+        query_groups.append(("language_genre", genres, [], language, 100))
+    if genres and keywords:
+        query_groups.append(("keyword", genres, keywords, None, 500))
+    if genres:
+        query_groups.append(("genre", genres, [], None, 300))
+    for source, query_genres, query_keywords, language, vote_floor in query_groups:
         for page in (1, 2):
-            params = build_tmdb_params(
-                values if source == "genre" else [], values if source == "keyword" else [], page
-            )
+            params = build_tmdb_params(query_genres, query_keywords, page)
             if excludes:
                 params["without_genres"] = "|".join(map(str, excludes))
-            if profile.original_languages:
-                params["with_original_language"] = "|".join(profile.original_languages)
-                params["vote_count.gte"] = 100
-            else:
-                params["vote_count.gte"] = 300
+            if language:
+                params["with_original_language"] = language
+            params["vote_count.gte"] = vote_floor
             params["sort_by"] = "popularity.desc"
             output.append((source, params))
     return output
@@ -212,15 +225,17 @@ async def _safe_catalog_call(awaitable: Any, endpoint: str) -> CatalogResult:
 
 
 async def _resolve_keyword(clients: CatalogClients, name: str) -> CatalogResult:
-    aliases = (name, *KEYWORD_SYNONYMS.get(name.casefold(), ()))
-    last_result = CatalogResult(f"search/keyword:{name}", "no_match", {"results": []})
-    for alias in aliases:
-        result = await _safe_catalog_call(clients.tmdb_keyword(alias), f"search/keyword:{alias}")
-        if result.ok:
-            return result
-        detail = result.error_detail or result.error_message or f"HTTP {result.status}"
-        detail = redact_secrets(detail)
-        error_class = "KeywordNoMatch" if result.status == "no_match" else detail.split(":", 1)[0]
+    result = await _safe_catalog_call(clients.tmdb_keyword(name), f"search/keyword:{name}")
+    if result.status == "no_match":
+        key = name.casefold()
+        if key not in _NO_MATCH_LOGGED:
+            logger.info("TMDB keyword has no exact match keyword=%s", name)
+            _NO_MATCH_LOGGED.add(key)
+    elif not result.ok:
+        detail = redact_secrets(
+            result.error_detail or result.error_message or f"HTTP {result.status}"
+        )
+        error_class = detail.split(":", 1)[0]
         message = detail.split(":", 1)[-1].strip()[:120]
         logger.warning(
             "upstream failure provider=TMDB endpoint=%s exception=%s message=%s",
@@ -228,10 +243,81 @@ async def _resolve_keyword(clients: CatalogClients, name: str) -> CatalogResult:
             error_class[:60],
             message,
         )
-        last_result = result
-        if result.status != "no_match":
+    return result
+
+
+def normalize_catalog_name(value: str) -> str:
+    """Casefold a title and remove diacritic marks for exact catalog matching."""
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def parse_anchor(anchor: str) -> tuple[str, int | None]:
+    """Split a movie anchor into its title and year when supplied."""
+    match = re.fullmatch(r"(.+?)\s*\((\d{4})\)", anchor.strip())
+    return (match.group(1).strip(), int(match.group(2))) if match else (anchor.strip(), None)
+
+
+async def resolve_tmdb_anchor(clients: CatalogClients, anchor: str) -> dict[str, Any] | None:
+    """Resolve an exact title and a release year within one year of its anchor."""
+    title, year = parse_anchor(anchor)
+    result = await clients.tmdb_search_movie(title)
+    return match_tmdb_anchor_result(result, title, year)
+
+
+def match_tmdb_anchor_result(
+    result: CatalogResult, title: str, year: int | None
+) -> dict[str, Any] | None:
+    """Select an exact title/year record from a TMDB search result."""
+    if not result.ok:
+        return None
+    wanted = normalize_catalog_name(title)
+    for item in _items(result, "results"):
+        actual = str(item.get("title", item.get("original_title", "")))
+        if normalize_catalog_name(actual) != wanted:
             continue
-    return last_result
+        release = str(item.get("release_date", ""))
+        try:
+            actual_year = int(release[:4])
+        except ValueError:
+            continue
+        if year is None or abs(actual_year - year) <= 1:
+            return item
+    return None
+
+
+async def resolve_igdb_anchor(
+    clients: CatalogClients, anchor: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Resolve exact game names accent-insensitively and return similar records."""
+    result = await clients.igdb_search_game(anchor)
+    if not result.ok:
+        return None, []
+    wanted = normalize_catalog_name(anchor)
+    matches = [
+        item
+        for item in _items(result)
+        if normalize_catalog_name(str(item.get("name", ""))) == wanted
+    ]
+    if not matches:
+        return None, []
+    full = await clients.igdb_games_by_ids(
+        [int(matches[0]["id"])], rating_count_floor=None, rating_floor=None
+    )
+    candidate = next(iter(_items(full)), None) if full.ok else None
+    return candidate, matches
+
+
+def exact_igdb_anchor_matches(result: CatalogResult, anchor: str) -> list[dict[str, Any]]:
+    """Return only accent-normalized exact IGDB game-name matches."""
+    if not result.ok:
+        return []
+    wanted = normalize_catalog_name(anchor)
+    return [
+        item
+        for item in _items(result)
+        if normalize_catalog_name(str(item.get("name", ""))) == wanted
+    ]
 
 
 def _keyword_failure(result: CatalogResult) -> str:
@@ -239,6 +325,15 @@ def _keyword_failure(result: CatalogResult) -> str:
         return "no_match"
     detail = result.error_detail or result.error_message or "upstream_error"
     return detail.split(":", 1)[0][:40]
+
+
+def _keyword_errors(results: dict[str, CatalogResult]) -> dict[str, str]:
+    """Return real keyword lookup failures, excluding ordinary no-match results."""
+    return {
+        name: _keyword_failure(result)
+        for name, result in results.items()
+        if not result.ok and result.status != "no_match"
+    }
 
 
 def _tmdb_ids(intent: dict[str, Any], ids: dict[str, Any]) -> tuple[list[int], list[int]]:

@@ -40,16 +40,13 @@ def test_intent_names_resolve_to_runtime_query_ids() -> None:
     ids = {
         "tmdb_genres": {"science fiction": 878, "thriller": 53},
         "tmdb_keywords": {
-            name.casefold(): index
-            for index, name in enumerate(intent["tmdb_keywords"], 10)
+            name.casefold(): index for index, name in enumerate(intent["tmdb_keywords"], 10)
         },
         "igdb_genres": {
-            name.casefold(): index
-            for index, name in enumerate(intent["igdb_genres"], 20)
+            name.casefold(): index for index, name in enumerate(intent["igdb_genres"], 20)
         },
         "igdb_themes": {
-            name.casefold(): index
-            for index, name in enumerate(intent["igdb_themes"], 30)
+            name.casefold(): index for index, name in enumerate(intent["igdb_themes"], 30)
         },
     }
     movie_queries = _tmdb_queries(intent, ids, "a")
@@ -227,7 +224,9 @@ def test_tmdb_retries_5xx_and_records_attempt(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("app.services.catalog.clients.random.uniform", lambda low, high: 0)
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     clients = CatalogClients(
-        tmdb_token="token", client=http, cache=JsonDiskCache(tmp_path / "cache"),
+        tmdb_token="token",
+        client=http,
+        cache=JsonDiskCache(tmp_path / "cache"),
         token_path=tmp_path / "token",
     )
     result = asyncio.run(clients.tmdb_genres())
@@ -253,7 +252,9 @@ def test_tmdb_transport_error_detail_includes_exception_and_attempt(monkeypatch,
     monkeypatch.setattr("app.services.catalog.clients.random.uniform", lambda low, high: 0)
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     clients = CatalogClients(
-        tmdb_token="token", client=http, cache=JsonDiskCache(tmp_path / "cache"),
+        tmdb_token="token",
+        client=http,
+        cache=JsonDiskCache(tmp_path / "cache"),
         token_path=tmp_path / "token",
     )
     result = asyncio.run(clients.tmdb_keyword("keyword"))
@@ -279,15 +280,15 @@ def test_tmdb_semaphore_bounds_concurrent_calls(tmp_path) -> None:
 
     fake = SlowClient()
     clients = CatalogClients(
-        tmdb_token="token", client=fake,
+        tmdb_token="token",
+        client=fake,
         token_path=tmp_path / "token",
     )
 
     async def exercise() -> None:
-        await asyncio.gather(*(
-            clients.tmdb_discover({"page": page}, cold=True)
-            for page in range(12)
-        ))
+        await asyncio.gather(
+            *(clients.tmdb_discover({"page": page}, cold=True) for page in range(12))
+        )
 
     asyncio.run(exercise())
     assert fake.maximum == 2
@@ -333,13 +334,13 @@ def test_cache_dir_environment_defaults_and_override(monkeypatch, tmp_path) -> N
     assert get_cache_dir() == DEVELOPMENT_CACHE_DIR
 
 
-def test_keyword_match_prefers_exact_then_highest_rank() -> None:
+def test_keyword_match_requires_exact_case_insensitive_name() -> None:
     results = [
         {"id": 1, "name": "near", "score": 0.98},
         {"id": 2, "name": "Exact Key", "score": 0.4},
     ]
     assert select_keyword_match(results, "exact key")["id"] == 2
-    assert select_keyword_match(results[:1], "missing")["id"] == 1
+    assert select_keyword_match(results[:1], "missing") is None
     assert select_keyword_match([], "missing") is None
 
 
@@ -349,7 +350,9 @@ def test_keyword_empty_200_is_no_match(tmp_path) -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     clients = CatalogClients(
-        tmdb_token="token", client=http, cache=JsonDiskCache(tmp_path / "cache"),
+        tmdb_token="token",
+        client=http,
+        cache=JsonDiskCache(tmp_path / "cache"),
         token_path=tmp_path / "token",
     )
     result = asyncio.run(clients.tmdb_keyword("not found"))
@@ -372,7 +375,8 @@ def test_fallback_ladder_stops_at_first_rung_with_sixty_movies() -> None:
             else:
                 ids = range(200, 260)
             return CatalogResult(
-                "discover/movie", 200,
+                "discover/movie",
+                200,
                 {"results": [{"id": item, "title": f"Movie {item}"} for item in ids]},
             )
 
@@ -476,10 +480,9 @@ def test_igdb_semaphore_caps_open_requests_and_records_separate_timings(tmp_path
     clients._token_expiry = 10_000_000_000
 
     async def exercise() -> list[CatalogResult]:
-        return await asyncio.gather(*(
-            clients.igdb_games("fields id; limit 1;", cold=True)
-            for _ in range(12)
-        ))
+        return await asyncio.gather(
+            *(clients.igdb_games("fields id; limit 1;", cold=True) for _ in range(12))
+        )
 
     results = asyncio.run(exercise())
     assert fake.maximum == 8

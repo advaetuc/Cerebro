@@ -20,9 +20,7 @@ class FakeLastFm:
             {"name": f"Artist {index}", "playcount": str(index + 1)}
             for index in range(self.artists)
         ]
-        return LastFmResult(
-            "user.getTopArtists", 200, {"topartists": {"artist": entries}}
-        )
+        return LastFmResult("user.getTopArtists", 200, {"topartists": {"artist": entries}})
 
     def user_get_info(self, username: str) -> LastFmResult:
         return LastFmResult("user.getInfo", 200, {"user": {"playcount": "100"}})
@@ -37,7 +35,8 @@ class FakeLastFm:
 
     def artist_get_info(self, artist: str) -> LastFmResult:
         return LastFmResult(
-            "artist.getInfo", 200,
+            "artist.getInfo",
+            200,
             {"artist": {"stats": {"listeners": "100000"}}},
         )
 
@@ -46,12 +45,16 @@ class FakeLastFm:
 
 
 class FakeRanker:
-    async def rank(self, vector, primary, secondary, *, top_families=None):
+    async def rank(self, vector, primary, secondary, *, top_families=None, top_artist_names=None):
         return {
             "movies": [
                 {
-                    "id": str(index), "title": f"Movie {index}", "year": "2020",
-                    "image_url": None, "score": 0.8, "match_pct": 90,
+                    "id": str(index),
+                    "title": f"Movie {index}",
+                    "year": "2020",
+                    "image_url": None,
+                    "score": 0.8,
+                    "match_pct": 90,
                     "why": "Matches your taste.",
                     "source_url": "https://example.test/movie",
                 }
@@ -59,8 +62,12 @@ class FakeRanker:
             ],
             "games": [
                 {
-                    "id": str(index), "title": f"Game {index}", "year": "2020",
-                    "image_url": None, "score": 0.8, "match_pct": 90,
+                    "id": str(index),
+                    "title": f"Game {index}",
+                    "year": "2020",
+                    "image_url": None,
+                    "score": 0.8,
+                    "match_pct": 90,
                     "why": "Matches your taste.",
                     "source_url": "https://example.test/game",
                 }
@@ -78,15 +85,19 @@ def _client(lastfm: FakeLastFm | None = None) -> TestClient:
 
 def test_seed_analyze_returns_response_shape() -> None:
     with _client() as client:
-        response = client.post(
-            "/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]}
-        )
+        response = client.post("/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]})
     app.dependency_overrides.clear()
     assert response.status_code == 200
     data = response.json()
     assert set(data["vector"]) == {
-        "energy", "valence", "acousticness", "danceability",
-        "instrumentalness", "tempo", "era", "mainstream",
+        "energy",
+        "valence",
+        "acousticness",
+        "danceability",
+        "instrumentalness",
+        "tempo",
+        "era",
+        "mainstream",
     }
     assert len(data["movies"]) == 10
     assert len(data["games"]) == 10
@@ -119,14 +130,15 @@ def test_unknown_lastfm_user_returns_404_message() -> None:
     class UnknownUser(FakeLastFm):
         def user_get_info(self, username: str) -> LastFmResult:
             return LastFmResult(
-                "user.getInfo", 200,
-                {"error": 6, "message": "User not found"}, 6, "User not found",
+                "user.getInfo",
+                200,
+                {"error": 6, "message": "User not found"},
+                6,
+                "User not found",
             )
 
     with _client(UnknownUser()) as client:
-        response = client.post(
-            "/analyze", json={"mode": "lastfm", "username": "no_such_user"}
-        )
+        response = client.post("/analyze", json={"mode": "lastfm", "username": "no_such_user"})
     app.dependency_overrides.clear()
     assert response.status_code == 404
     assert response.json() == {
@@ -139,21 +151,18 @@ def test_private_and_empty_profiles_return_friendly_422() -> None:
     class PrivateUser(FakeLastFm):
         def user_get_info(self, username: str) -> LastFmResult:
             return LastFmResult(
-                "user.getInfo", 200,
+                "user.getInfo",
+                200,
                 {"error": 17, "message": "User does not have a public profile"},
                 17,
                 "User does not have a public profile",
             )
 
     with _client(PrivateUser()) as client:
-        private = client.post(
-            "/analyze", json={"mode": "lastfm", "username": "private_user"}
-        )
+        private = client.post("/analyze", json={"mode": "lastfm", "username": "private_user"})
     app.dependency_overrides.clear()
     with _client(FakeLastFm(artists=0)) as client:
-        empty = client.post(
-            "/analyze", json={"mode": "lastfm", "username": "empty_user"}
-        )
+        empty = client.post("/analyze", json={"mode": "lastfm", "username": "empty_user"})
     app.dependency_overrides.clear()
     assert private.status_code == 422
     assert "private" in private.json()["message"]
@@ -163,15 +172,11 @@ def test_private_and_empty_profiles_return_friendly_422() -> None:
 
 def test_bad_username_and_seed_inputs_return_422() -> None:
     with _client() as client:
-        invalid_username = client.post(
-            "/analyze", json={"mode": "lastfm", "username": "user name"}
-        )
+        invalid_username = client.post("/analyze", json={"mode": "lastfm", "username": "user name"})
         duplicate_seed = client.post(
             "/analyze", json={"mode": "seed", "artists": ["One", "one", "Three"]}
         )
-        short_seed = client.post(
-            "/analyze", json={"mode": "seed", "artists": ["One", "Two"]}
-        )
+        short_seed = client.post("/analyze", json={"mode": "seed", "artists": ["One", "Two"]})
         long_artist = client.post(
             "/analyze", json={"mode": "seed", "artists": ["x" * 101, "Two", "Three"]}
         )
@@ -219,9 +224,7 @@ def test_config_error_returns_503_with_clear_message() -> None:
     app.dependency_overrides[get_lastfm_client] = fail_config
     app.dependency_overrides[get_ranking_service] = lambda: FakeRanker()
     with TestClient(app) as client:
-        response = client.post(
-            "/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]}
-        )
+        response = client.post("/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]})
     app.dependency_overrides.clear()
     assert response.status_code == 503
     assert "re-copy the full token" in response.json()["detail"]
@@ -229,9 +232,12 @@ def test_config_error_returns_503_with_clear_message() -> None:
 
 def test_catalog_failures_return_partial_results_without_502() -> None:
     class PartialRanker(FakeRanker):
-        async def rank(self, vector, primary, secondary, *, top_families=None):
+        async def rank(
+            self, vector, primary, secondary, *, top_families=None, top_artist_names=None
+        ):
             return {
-                "movies": [], "games": [{"id": "g1", "title": "Game"}],
+                "movies": [],
+                "games": [{"id": "g1", "title": "Game"}],
                 "degraded": True,
                 "degraded_reasons": ["movies unavailable"],
             }
@@ -239,9 +245,7 @@ def test_catalog_failures_return_partial_results_without_502() -> None:
     app.dependency_overrides[get_lastfm_client] = lambda: FakeLastFm()
     app.dependency_overrides[get_ranking_service] = lambda: PartialRanker()
     with TestClient(app) as client:
-        response = client.post(
-            "/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]}
-        )
+        response = client.post("/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]})
     app.dependency_overrides.clear()
     assert response.status_code == 200
     assert response.json()["movies"] == []
@@ -251,9 +255,13 @@ def test_catalog_failures_return_partial_results_without_502() -> None:
 
 def test_both_catalog_failures_return_provider_and_reason(caplog) -> None:
     class FailedRanker(FakeRanker):
-        async def rank(self, vector, primary, secondary, *, top_families=None):
+        async def rank(
+            self, vector, primary, secondary, *, top_families=None, top_artist_names=None
+        ):
             return {
-                "movies": [], "games": [], "degraded": True,
+                "movies": [],
+                "games": [],
+                "degraded": True,
                 "upstream_error": True,
                 "failed_providers": ["TMDB", "IGDB"],
             }
@@ -261,13 +269,12 @@ def test_both_catalog_failures_return_provider_and_reason(caplog) -> None:
     app.dependency_overrides[get_lastfm_client] = lambda: FakeLastFm()
     app.dependency_overrides[get_ranking_service] = lambda: FailedRanker()
     with TestClient(app) as client:
-        response = client.post(
-            "/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]}
-        )
+        response = client.post("/analyze", json={"mode": "seed", "artists": ["A", "B", "C"]})
     app.dependency_overrides.clear()
     assert response.status_code == 502
     assert response.json() == {
-        "provider": "TMDB/IGDB", "reason": "Catalog results are unavailable."
+        "provider": "TMDB/IGDB",
+        "reason": "Catalog results are unavailable.",
     }
     assert "provider=TMDB/IGDB" in caplog.text
     assert "endpoint=catalog retrieval" in caplog.text

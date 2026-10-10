@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+from app.services.catalog.clients import CatalogClients
 from app.services.catalog.family_profiles import (
     FAMILY_LABELS,
     FILM_PROFILES,
     GAME_PROFILES,
 )
+from app.services.catalog.retrieval import _prepare
 
 API_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = API_ROOT.parents[1] / "docs" / "family_profiles_review.md"
@@ -46,13 +49,33 @@ def render_table() -> str:
     return "\n".join(lines) + "\n"
 
 
-def main() -> None:
+async def render_keyword_table() -> str:
+    """Resolve exact TMDB keyword names and render their IDs for review."""
+    clients = CatalogClients()
+    try:
+        ids = await _prepare(clients)
+    finally:
+        await clients.close()
+    lines = ["| family | keyword | tmdb id | resolved |", "|---|---|---:|---|"]
+    for family_id, film in FILM_PROFILES.items():
+        for keyword in film.tmdb_keywords:
+            value = ids["tmdb_keywords"].get(keyword.casefold())
+            resolved = "yes" if value else "no"
+            lines.append(
+                f"| {FAMILY_LABELS[family_id]} | {keyword} | {value or '—'} | {resolved} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+async def main() -> None:
     """Print the profile table and save a review copy in docs."""
     table = render_table()
+    keyword_table = await render_keyword_table()
+    output = table + "\n" + keyword_table
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text(table, encoding="utf-8")
-    print(table, end="")
+    OUTPUT.write_text(output, encoding="utf-8")
+    print(output, end="")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
