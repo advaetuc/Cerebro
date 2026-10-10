@@ -58,7 +58,7 @@ export function PosterCard({ pick, kind }: { pick: Pick; kind: "movie" | "game" 
         {pick.regional && <span className="regional-badge">Regional</span>}
         <span className="match-badge">{pick.match_pct}% match</span>
       </div>
-      <div className="poster-copy"><h3>{pick.title}</h3><span className="poster-year">{pick.year || "A new discovery"}</span><p>{pick.why}</p></div>
+      <div className="poster-copy"><h3>{pick.title}</h3><span className="poster-year">{pick.year || "A new discovery"}</span>{pick.matched_family && <span className="family-badge">via {pick.matched_family.label}</span>}<p>{pick.why}</p></div>
     </a>
   </article>;
 }

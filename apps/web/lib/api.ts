@@ -9,6 +9,8 @@ export type Pick = {
   why: string;
   source_url: string;
   regional?: boolean;
+  matched_family?: { id: string; label: string };
+  reason_source?: "anchor_rec" | "keyword" | "genre";
 };
 export type VibeResult = {
   vector: Record<string, number>;

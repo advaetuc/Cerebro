@@ -20,6 +20,7 @@ from .clients import (
     build_tmdb_params,
     redact_secrets,
 )
+from .family_profiles import FILM_PROFILES
 
 SPIKE_DIR = Path(__file__).resolve().parents[3] / "spike"
 BLUEPRINT_PATH = SPIKE_DIR.parents[2] / "docs" / "cerebro_blueprint.md"
@@ -110,6 +111,7 @@ async def _prepare(clients: CatalogClients) -> dict[str, Any]:
     """Resolve every catalog name before retrieval timing begins."""
     keyword_names = sorted(
         {name for intent in INTENTS.values() for name in intent["tmdb_keywords"]}
+        | {name for profile in FILM_PROFILES.values() for name in profile.tmdb_keywords}
     )
     tmdb_genres, igdb_genres, igdb_themes, *keywords = await asyncio.gather(
         _safe_catalog_call(clients.tmdb_genres(), "genre/movie/list"),
@@ -119,16 +121,15 @@ async def _prepare(clients: CatalogClients) -> dict[str, Any]:
     )
     keyword_results = dict(zip(keyword_names, keywords, strict=True))
     unresolved = {
-        name: _keyword_failure(result)
-        for name, result in keyword_results.items()
-        if not result.ok
+        name: _keyword_failure(result) for name, result in keyword_results.items() if not result.ok
     }
     return {
         "tmdb_genres": _name_ids(_items(tmdb_genres, "genres")) if tmdb_genres.ok else {},
         "tmdb_keywords": {
             name.casefold(): (
                 int(_items(result, "results")[0]["id"])
-                if result.ok and _items(result, "results")
+                if result.ok
+                and _items(result, "results")
                 and _items(result, "results")[0].get("id") is not None
                 else None
             )
@@ -142,6 +143,62 @@ async def _prepare(clients: CatalogClients) -> dict[str, Any]:
         "igdb_themes": _name_ids(_items(igdb_themes)) if igdb_themes.ok else {},
         "boot_results": [tmdb_genres, igdb_genres, igdb_themes, *keywords],
     }
+
+
+def family_tmdb_query_groups(profile: Any, ids: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Build separate genre and keyword OR queries with provenance labels."""
+    genres = [
+        ids["tmdb_genres"][name.casefold()]
+        for name in profile.tmdb_genres
+        if name.casefold() in ids["tmdb_genres"]
+    ]
+    keywords = [
+        ids["tmdb_keywords"][name.casefold()]
+        for name in profile.tmdb_keywords
+        if ids["tmdb_keywords"].get(name.casefold()) is not None
+    ]
+    excludes = [
+        ids["tmdb_genres"][name.casefold()]
+        for name in profile.exclude_genres
+        if name.casefold() in ids["tmdb_genres"]
+    ]
+    groups = [("genre", genres)] if genres else []
+    groups.extend([("keyword", keywords)] if keywords else [])
+    output = []
+    for source, values in groups:
+        for page in (1, 2):
+            params = build_tmdb_params(
+                values if source == "genre" else [], values if source == "keyword" else [], page
+            )
+            if excludes:
+                params["without_genres"] = "|".join(map(str, excludes))
+            if profile.original_languages:
+                params["with_original_language"] = "|".join(profile.original_languages)
+                params["vote_count.gte"] = 100
+            else:
+                params["vote_count.gte"] = 300
+            params["sort_by"] = "popularity.desc"
+            output.append((source, params))
+    return output
+
+
+def family_igdb_bodies(profile: Any, ids: dict[str, Any]) -> list[str]:
+    """Build family genre, theme, and combined IGDB query bodies."""
+    genres = [
+        ids["igdb_genres"][name.casefold()]
+        for name in profile.igdb_genres
+        if name.casefold() in ids["igdb_genres"]
+    ]
+    themes = [
+        ids["igdb_themes"][name.casefold()]
+        for name in profile.igdb_themes
+        if name.casefold() in ids["igdb_themes"]
+    ]
+    return [
+        build_apicalypse(genres, themes, mode)
+        for mode in ("genres", "themes", "combined")
+        if (genres if mode == "genres" else themes if mode == "themes" else genres and themes)
+    ]
 
 
 async def _safe_catalog_call(awaitable: Any, endpoint: str) -> CatalogResult:
@@ -263,8 +320,11 @@ async def _fetch_intent(
         rung_used = rung
         if len(selected_items) >= 60:
             break
-    unresolved = [name for name in intent["tmdb_keywords"]
-                  if ids["tmdb_keywords"].get(name.casefold()) is None]
+    unresolved = [
+        name
+        for name in intent["tmdb_keywords"]
+        if ids["tmdb_keywords"].get(name.casefold()) is None
+    ]
     keyword_errors = ids.get("unresolved_keywords", {})
     degraded = (
         rung_used != "a"
@@ -316,13 +376,9 @@ async def _fetch_igdb_approach(
     """Run either three IGDB requests or one multiquery request."""
     started = time.perf_counter()
     if mode == "separate":
-        calls = await asyncio.gather(
-            *(clients.igdb_games(body, cold=cold) for _, body in bodies)
-        )
+        calls = await asyncio.gather(*(clients.igdb_games(body, cold=cold) for _, body in bodies))
     else:
-        calls = [
-            await clients.igdb_multiquery(build_multiquery(bodies), cold=cold)
-        ]
+        calls = [await clients.igdb_multiquery(build_multiquery(bodies), cold=cold)]
     total_ms = (time.perf_counter() - started) * 1000
     return {
         "calls": calls,
@@ -402,12 +458,14 @@ def _jaccard_report(profiles: list[dict[str, Any]], id_key: str) -> dict[str, An
             right_ids = set(right[id_key])
             union = left_ids | right_ids
             score = len(left_ids & right_ids) / len(union) if union else 0.0
-            pairs.append({
-                "left": left["archetype"],
-                "right": right["archetype"],
-                "jaccard": round(score, 4),
-                "overlap_flag": score > 0.5,
-            })
+            pairs.append(
+                {
+                    "left": left["archetype"],
+                    "right": right["archetype"],
+                    "jaccard": round(score, 4),
+                    "overlap_flag": score > 0.5,
+                }
+            )
     scores = [pair["jaccard"] for pair in pairs]
     return {
         "mean": round(statistics.mean(scores), 4) if scores else 0.0,
@@ -471,18 +529,22 @@ async def run_probe(cold: bool = False, igdb_mode: str = "auto") -> dict[str, An
                     _fetch_igdb_approach(clients, bodies, "separate", force_cold),
                     _fetch_igdb_approach(clients, bodies, "multiquery", force_cold),
                 )
-                runs.append({
-                    "movie": movie_run,
-                    "separate": separate_run,
-                    "multiquery": multiquery_run,
-                    "total_ms": (time.perf_counter() - started) * 1000,
-                    "kind": "cold" if force_cold else "warm",
-                })
-            profile_runs.append({
-                "archetype": archetype,
-                "intent": intent,
-                "runs": runs,
-            })
+                runs.append(
+                    {
+                        "movie": movie_run,
+                        "separate": separate_run,
+                        "multiquery": multiquery_run,
+                        "total_ms": (time.perf_counter() - started) * 1000,
+                        "kind": "cold" if force_cold else "warm",
+                    }
+                )
+            profile_runs.append(
+                {
+                    "archetype": archetype,
+                    "intent": intent,
+                    "runs": runs,
+                }
+            )
         approach_samples = {
             mode: [
                 {"total_ms": run[mode]["total_ms"], "api_ms": run[mode]["api_ms"], "mode": mode}
@@ -504,24 +566,18 @@ async def run_probe(cold: bool = False, igdb_mode: str = "auto") -> dict[str, An
             intent = profile["intent"]
             movie_calls = [call for run in runs for call in run["movie"]["calls"]]
             movie_items = _dedupe(movie_calls, "results")
-            selected_calls = [
-                call for run in runs for call in run[selected_mode]["calls"]
-            ]
+            selected_calls = [call for run in runs for call in run[selected_mode]["calls"]]
             game_items = _dedupe_games(selected_calls)
             unresolved = [
-                name for name in intent["tmdb_keywords"]
+                name
+                for name in intent["tmdb_keywords"]
                 if ids["tmdb_keywords"].get(name.casefold()) is None
             ]
             movie_stats = _latency_stats([run["movie"]["movie_ms"] for run in runs])
-            game_total_stats = _latency_stats(
-                [run[selected_mode]["total_ms"] for run in runs]
-            )
-            game_api_stats = _latency_stats(
-                [run[selected_mode]["api_ms"] for run in runs]
-            )
+            game_total_stats = _latency_stats([run[selected_mode]["total_ms"] for run in runs])
+            game_api_stats = _latency_stats([run[selected_mode]["api_ms"] for run in runs])
             total_stats = _latency_stats(
-                [max(run["movie"]["movie_ms"], run[selected_mode]["total_ms"])
-                 for run in runs]
+                [max(run["movie"]["movie_ms"], run[selected_mode]["total_ms"]) for run in runs]
             )
             rung_used = runs[0]["movie"]["rung_used"]
             degraded = (
@@ -534,47 +590,51 @@ async def run_probe(cold: bool = False, igdb_mode: str = "auto") -> dict[str, An
             for name in intent["tmdb_keywords"]:
                 result = ids["keyword_results"][name.casefold()]
                 keyword_metrics[name] = _call_metrics([result], "results")[0]
-            report_rows.append({
-                "archetype": profile["archetype"],
-                "movie_count": len(movie_items),
-                "game_count": len(game_items),
-                "rung_used": rung_used,
-                "degraded": degraded,
-                "unresolved_keywords": unresolved,
-                "keyword_lookups": keyword_metrics,
-                "latency_ms": {
-                    "movie_ms": movie_stats,
-                    "game_total_ms": game_total_stats,
-                    "game_api_ms": game_api_stats,
-                    "total_ms": total_stats,
-                },
-                "igdb_mode": selected_mode,
-                "igdb_mapping_note": intent.get("mapping_note"),
-                "igdb_approaches": {
-                    mode: {
-                        **_approach_summary([
-                            {
-                                "mode": mode,
-                                "total_ms": run[mode]["total_ms"],
-                                "api_ms": run[mode]["api_ms"],
-                            }
-                            for run in runs
-                        ]),
-                        "calls": _game_call_metrics([
-                            call for run in runs for call in run[mode]["calls"]
-                        ]),
-                    }
-                    for mode in ("separate", "multiquery")
-                },
-                "calls": {
-                    "tmdb": _call_metrics(movie_calls, "results"),
-                    "igdb": _game_call_metrics(selected_calls),
-                },
-                "top_movie_titles": [item.get("title", "") for item in movie_items[:5]],
-                "top_game_titles": [item.get("name", "") for item in game_items[:5]],
-                "movie_ids": [item["id"] for item in movie_items],
-                "game_ids": [item["id"] for item in game_items],
-            })
+            report_rows.append(
+                {
+                    "archetype": profile["archetype"],
+                    "movie_count": len(movie_items),
+                    "game_count": len(game_items),
+                    "rung_used": rung_used,
+                    "degraded": degraded,
+                    "unresolved_keywords": unresolved,
+                    "keyword_lookups": keyword_metrics,
+                    "latency_ms": {
+                        "movie_ms": movie_stats,
+                        "game_total_ms": game_total_stats,
+                        "game_api_ms": game_api_stats,
+                        "total_ms": total_stats,
+                    },
+                    "igdb_mode": selected_mode,
+                    "igdb_mapping_note": intent.get("mapping_note"),
+                    "igdb_approaches": {
+                        mode: {
+                            **_approach_summary(
+                                [
+                                    {
+                                        "mode": mode,
+                                        "total_ms": run[mode]["total_ms"],
+                                        "api_ms": run[mode]["api_ms"],
+                                    }
+                                    for run in runs
+                                ]
+                            ),
+                            "calls": _game_call_metrics(
+                                [call for run in runs for call in run[mode]["calls"]]
+                            ),
+                        }
+                        for mode in ("separate", "multiquery")
+                    },
+                    "calls": {
+                        "tmdb": _call_metrics(movie_calls, "results"),
+                        "igdb": _game_call_metrics(selected_calls),
+                    },
+                    "top_movie_titles": [item.get("title", "") for item in movie_items[:5]],
+                    "top_game_titles": [item.get("name", "") for item in game_items[:5]],
+                    "movie_ids": [item["id"] for item in movie_items],
+                    "game_ids": [item["id"] for item in game_items],
+                }
+            )
         movie_jaccard = _jaccard_report(report_rows, "movie_ids")
         game_jaccard = _jaccard_report(report_rows, "game_ids")
         report = {
@@ -582,14 +642,12 @@ async def run_probe(cold: bool = False, igdb_mode: str = "auto") -> dict[str, An
             "igdb_mode_requested": igdb_mode,
             "igdb_default_mode": measured_default,
             "igdb_request_count_basis": (
-                "HTTP requests sent by this probe; multiquery contains "
-                "3 subqueries in 1 request."
+                "HTTP requests sent by this probe; multiquery contains 3 subqueries in 1 request."
             ),
             "connect_tls": connection_times,
             "differentiation": {"movies": movie_jaccard, "games": game_jaccard},
             "id_list_boot_calls": [
-                _call_metrics([result], "")[0]
-                for result in ids["boot_results"]
+                _call_metrics([result], "")[0] for result in ids["boot_results"]
             ],
             "archetypes": report_rows,
         }
@@ -600,14 +658,8 @@ async def run_probe(cold: bool = False, igdb_mode: str = "auto") -> dict[str, An
         REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
         for line in _table_lines(report):
             print(line)
-        print(
-            "Jaccard movies mean/max | "
-            f"{movie_jaccard['mean']}/{movie_jaccard['max']}"
-        )
-        print(
-            "Jaccard games mean/max | "
-            f"{game_jaccard['mean']}/{game_jaccard['max']}"
-        )
+        print(f"Jaccard movies mean/max | {movie_jaccard['mean']}/{movie_jaccard['max']}")
+        print(f"Jaccard games mean/max | {game_jaccard['mean']}/{game_jaccard['max']}")
         print(f"IGDB default mode | {measured_default}")
         print(f"connect+TLS | TMDB {connection_times['tmdb']} | IGDB {connection_times['igdb']}")
         return report

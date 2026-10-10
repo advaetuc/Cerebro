@@ -94,26 +94,22 @@ class VibeResolver:
                     for family_id, share in distribution.items()
                 )
                 family_prior[dimension] = sum(
-                    FAMILY_BY_ID[family_id].dims[index]
-                    for family_id in distribution
+                    FAMILY_BY_ID[family_id].dims[index] for family_id in distribution
                 ) / len(distribution)
                 vector[dimension] = (
                     T2_WEIGHT * tag_projection + T3_WEIGHT * family_prior[dimension]
                 ) / (T2_WEIGHT + T3_WEIGHT)
-                confidence[dimension] = min(
-                    1.0, T3_WEIGHT + T2_WEIGHT * tag_coverage
-                )
+                confidence[dimension] = min(1.0, T3_WEIGHT + T2_WEIGHT * tag_coverage)
         if decade_weights:
             total_decade_weight = sum(weight for _, weight in decade_weights)
-            vector["era"] = sum(
-                _decade_value(year) * weight for year, weight in decade_weights
-            ) / total_decade_weight
+            vector["era"] = (
+                sum(_decade_value(year) * weight for year, weight in decade_weights)
+                / total_decade_weight
+            )
             confidence["era"] = 0.25
         listener_value = mainstream_from_listeners(artist.listeners)
         if listener_value is not None:
-            vector["mainstream"] = blend_mainstream(
-                listener_value, family_prior["mainstream"]
-            )
+            vector["mainstream"] = blend_mainstream(listener_value, family_prior["mainstream"])
             confidence["mainstream"] = (
                 0.7 * T2_WEIGHT + 0.3 * T3_WEIGHT if distribution else T2_WEIGHT
             )
@@ -159,9 +155,7 @@ class VibeResolver:
         coverage = coverage_tag_weight / total_tag_weight if total_tag_weight else 0.0
         total_play_weight = sum(math.sqrt(item["play_weight"]) for item in resolved)
         borrowed_weight = sum(
-            math.sqrt(item["play_weight"])
-            for item in resolved
-            if item["borrowed"]
+            math.sqrt(item["play_weight"]) for item in resolved if item["borrowed"]
         )
         borrowed_share = borrowed_weight / total_play_weight if total_play_weight else 0.0
         artist_factor = min(1.0, math.sqrt(len(resolved) / 10.0))
@@ -173,12 +167,16 @@ class VibeResolver:
             for family_id, share in item["family_distribution"].items():
                 family_totals[family_id] = family_totals.get(family_id, 0.0) + share * play_weight
         family_denominator = sum(family_totals.values())
-        top_families = [
-            {"id": family_id, "share": family_weight / family_denominator}
-            for family_id, family_weight in sorted(
-                family_totals.items(), key=lambda entry: (-entry[1], entry[0])
-            )[:3]
-        ] if family_denominator else []
+        top_families = (
+            [
+                {"id": family_id, "share": family_weight / family_denominator}
+                for family_id, family_weight in sorted(
+                    family_totals.items(), key=lambda entry: (-entry[1], entry[0])
+                )[:4]
+            ]
+            if family_denominator
+            else []
+        )
         archetype_match = match_archetypes(dimension_values)
         return {
             "vector": dimension_values,

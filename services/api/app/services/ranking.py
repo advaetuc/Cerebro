@@ -1,4 +1,4 @@
-"""Small in-process recommendation ranker for the prototype API."""
+"""Family-aware catalog retrieval and recommendation ranking."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import logging
 import math
+import re
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from app.services.catalog.clients import (
@@ -18,78 +20,82 @@ from app.services.catalog.clients import (
     get_cache_dir,
     redact_secrets,
 )
+from app.services.catalog.family_profiles import (
+    FAMILY_LABELS,
+    FILM_PROFILES,
+    GAME_PROFILES,
+)
 from app.services.catalog.retrieval import (
     INTENTS,
     _dedupe_games,
     _fetch_intent,
     _igdb_query_bodies,
+    _items,
     _prepare,
+    family_igdb_bodies,
+    family_tmdb_query_groups,
 )
-from app.services.vibe.archetypes import ARCHETYPES, _standardize
-from app.services.vibe.genre_priors import DIMENSIONS, FAMILY_BY_ID
+from app.services.vibe.archetypes import ARCHETYPES, POPULATION_MEAN, POPULATION_STD
+from app.services.vibe.genre_priors import DIMENSIONS
 
 POOL_TTL_SECONDS = 24 * 60 * 60
-MMR_LAMBDA = 0.7
+MMR_LAMBDA = 0.75
 TOP_K = 10
-REGIONAL_FAMILIES = {
-    "hindi-film", "punjabi-pop", "haryanvi", "desi-hip-hop", "indian-indie"
-}
+COMPARABLE_DIMS = ("energy", "valence", "tempo", "era", "mainstream")
+DIM_INDEX = {name: DIMENSIONS.index(name) for name in COMPARABLE_DIMS}
 logger = logging.getLogger("cerebro.upstream")
 
-TMDB_GENRE_FAMILIES = {
-    "action": "hard-rock",
-    "adventure": "folk-rock",
-    "animation": "k-pop",
-    "comedy": "disco-dance",
-    "crime": "boom-bap",
-    "documentary": "experimental",
-    "drama": "singer-songwriter",
-    "family": "pop",
-    "fantasy": "world",
-    "history": "classical",
-    "horror": "metal",
-    "music": "disco-dance",
-    "mystery": "idm",
-    "romance": "r-and-b-soul",
-    "science fiction": "electropop",
-    "thriller": "downtempo-trip-hop",
-    "war": "metal",
-    "western": "americana",
+TMDB_MOODS: dict[str, tuple[float, float, float]] = {
+    "action": (0.92, 0.60, 0.90),
+    "adventure": (0.72, 0.72, 0.70),
+    "animation": (0.62, 0.75, 0.72),
+    "comedy": (0.65, 0.84, 0.68),
+    "crime": (0.72, 0.32, 0.60),
+    "documentary": (0.30, 0.52, 0.35),
+    "drama": (0.45, 0.40, 0.42),
+    "family": (0.55, 0.82, 0.55),
+    "fantasy": (0.62, 0.70, 0.62),
+    "history": (0.48, 0.55, 0.38),
+    "horror": (0.82, 0.20, 0.70),
+    "music": (0.70, 0.74, 0.72),
+    "mystery": (0.50, 0.35, 0.50),
+    "romance": (0.40, 0.78, 0.40),
+    "science fiction": (0.78, 0.55, 0.84),
+    "thriller": (0.82, 0.32, 0.72),
+    "war": (0.94, 0.22, 0.72),
+    "western": (0.58, 0.50, 0.46),
 }
-IGDB_GENRE_FAMILIES = {
-    "action": "hard-rock",
-    "adventure": "folk-rock",
-    "arcade": "disco-dance",
-    "indie": "indian-indie",
-    "music": "disco-dance",
-    "platform": "pop",
-    "puzzle": "idm",
-    "racing": "electropop",
-    "role-playing (rpg)": "world",
-    "shooter": "hip-hop",
-    "strategy": "boom-bap",
-}
-IGDB_THEME_FAMILIES = {
-    "4x": "boom-bap",
-    "action": "hard-rock",
-    "atmospheric": "ambient-chillout",
-    "cyberpunk": "electropop",
-    "fantasy": "world",
-    "indie": "indian-indie",
-    "narrative": "singer-songwriter",
-    "open world": "folk-rock",
-    "retro": "classic-rock",
-    "science fiction": "idm",
-    "turn-based strategy": "boom-bap",
-}
-TMDB_GENRE_CENTROIDS = {
-    genre: FAMILY_BY_ID[family].dims for genre, family in TMDB_GENRE_FAMILIES.items()
-}
-IGDB_GENRE_CENTROIDS = {
-    genre: FAMILY_BY_ID[family].dims for genre, family in IGDB_GENRE_FAMILIES.items()
-}
-IGDB_THEME_CENTROIDS = {
-    theme: FAMILY_BY_ID[family].dims for theme, family in IGDB_THEME_FAMILIES.items()
+IGDB_MOODS: dict[str, tuple[float, float, float]] = {
+    "action": (0.92, 0.64, 0.90),
+    "adventure": (0.68, 0.70, 0.67),
+    "arcade": (0.82, 0.84, 0.88),
+    "indie": (0.50, 0.62, 0.50),
+    "music": (0.73, 0.78, 0.78),
+    "platform": (0.72, 0.78, 0.80),
+    "puzzle": (0.38, 0.58, 0.42),
+    "racing": (0.90, 0.78, 0.94),
+    "role-playing (rpg)": (0.62, 0.62, 0.60),
+    "shooter": (0.94, 0.44, 0.90),
+    "strategy": (0.58, 0.52, 0.44),
+    "4x": (0.52, 0.54, 0.38),
+    "atmospheric": (0.30, 0.45, 0.34),
+    "cyberpunk": (0.78, 0.40, 0.80),
+    "fantasy": (0.60, 0.72, 0.56),
+    "narrative": (0.38, 0.58, 0.36),
+    "open world": (0.65, 0.70, 0.62),
+    "retro": (0.48, 0.55, 0.28),
+    "science fiction": (0.74, 0.55, 0.78),
+    "turn-based strategy": (0.48, 0.53, 0.35),
+    "party": (0.82, 0.86, 0.78),
+    "co-operative": (0.70, 0.80, 0.67),
+    "crime": (0.68, 0.35, 0.58),
+    "dark": (0.72, 0.25, 0.58),
+    "survival": (0.84, 0.30, 0.66),
+    "abstract": (0.40, 0.45, 0.40),
+    "experimental": (0.52, 0.42, 0.48),
+    "historical": (0.48, 0.58, 0.35),
+    "western": (0.57, 0.53, 0.42),
+    "romance": (0.40, 0.78, 0.40),
 }
 DIM_PHRASES = {
     "energy": ("slow-burning", "high-energy"),
@@ -101,108 +107,185 @@ DIM_PHRASES = {
     "era": ("classic", "modern"),
     "mainstream": ("left-of-center", "crowd-pleasing"),
 }
-WHY_TEMPLATES = (
-    "A {p1}, {p2} pick for your listening.",
-    "Echoes the {p1} and {p2} side of your taste.",
-    "Lines up with your {p1}, {p2} playlists.",
-    "Fits the {p1}, {p2} mood you keep coming back to.",
-)
-WHY_ONE_DIM_TEMPLATES = (
-    "A {phrase} pick for your listening.",
-    "Echoes the {phrase} side of your taste.",
-    "Lines up with your {phrase} playlists.",
-    "Fits the {phrase} mood you keep coming back to.",
-)
+_SOURCE_TEMPLATES = {
+    "anchor_rec": (
+        "For {family} listeners: recommended alongside {anchor}.",
+        "{anchor} points {family} listeners toward this pick.",
+    ),
+    "keyword": (
+        "Matches your {family} listening through its {keyword} themes.",
+        "Its {keyword} themes connect with your {family} listening.",
+    ),
+    "genre": (
+        "A {genre} pick that fits the {p1}, {p2} mood of your listening.",
+        "Your {p1}, {p2} taste finds a match in this {genre} pick.",
+    ),
+}
 
 
-def _cosine(left: dict[str, float], right: dict[str, float]) -> float:
-    left_values = _standardize(tuple(left[dim] for dim in DIMENSIONS))
-    right_values = _standardize(tuple(right[dim] for dim in DIMENSIONS))
-    dot = sum(a * b for a, b in zip(left_values, right_values, strict=True))
-    left_norm = math.sqrt(sum(value * value for value in left_values))
-    right_norm = math.sqrt(sum(value * value for value in right_values))
-    return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return min(high, max(low, value))
 
 
-def _id_name_map(values: list[Any]) -> dict[int | str, str]:
-    """Safely map raw genre configurations into a standard lookup dictionary."""
-    mapping = {}
-    if not isinstance(values, list):
-        return mapping
+def _zscore(value: float, dim: str) -> float:
+    index = DIM_INDEX[dim]
+    std = POPULATION_STD[index]
+    return (value - POPULATION_MEAN[index]) / std if std else 0.0
 
+
+def _comparable_cosine(user: dict[str, float], title: dict[str, float]) -> float:
+    left = [_zscore(user[dim], dim) for dim in COMPARABLE_DIMS]
+    right = [_zscore(title[dim], dim) for dim in COMPARABLE_DIMS]
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return sum(a * b for a, b in zip(left, right, strict=True)) / (left_norm * right_norm)
+
+
+def _genre_names(item: dict[str, Any], kind: str, id_map: dict[int | str, str]) -> set[str]:
+    key = "genre_ids" if kind == "movie" else "genres"
+    names: set[str] = set()
+    for raw in item.get(key, []):
+        value = raw.get("id") if isinstance(raw, dict) else raw
+        try:
+            identifier: int | str = int(value)
+        except (ValueError, TypeError):
+            identifier = str(value)
+        names.add(id_map.get(identifier, id_map.get(str(identifier), str(value))).casefold())
+    if kind == "game":
+        names.update(
+            str(value.get("name", "")).casefold()
+            for value in item.get("themes", [])
+            if isinstance(value, dict)
+        )
+    return names
+
+
+def _catalog_maps(values: list[Any]) -> dict[int | str, str]:
+    result: dict[int | str, str] = {}
     for item in values:
-        # Case A: The item is a flat string (e.g., 'action')
-        if isinstance(item, str):
-            cleaned_item = item.strip().casefold()
-            mapping[cleaned_item] = cleaned_item
-            # Try parsing it as a pure numeric ID string if possible
-            try:
-                mapping[int(cleaned_item)] = cleaned_item
-            except ValueError:
-                pass
-            continue
-            
-        # Case B: The item is a standard dictionary (e.g., {"id": 28, "name": "Action"})
-        if isinstance(item, dict):
-            item_id = item.get("id")
-            item_name = item.get("name")
-            if item_id is not None and item_name:
-                cleaned_name = str(item_name).casefold()
-                mapping[item_id] = cleaned_name
-                # Ensure integer string representations work as numeric index keys too
-                try:
-                    mapping[int(item_id)] = cleaned_name
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    mapping[str(item_id)] = cleaned_name
-                except (ValueError, TypeError):
-                    pass
+        if isinstance(item, dict) and item.get("id") is not None and item.get("name"):
+            result[item["id"]] = str(item["name"]).casefold()
+            result[str(item["id"])] = str(item["name"]).casefold()
+    return result
 
-    return mapping
 
+def _year_fraction(value: Any) -> float | None:
+    year_text = str(value or "")[:4]
+    try:
+        year = int(year_text)
+    except ValueError:
+        return None
+    return _clamp((year - 1950) / 70)
 
 
 def _title_vector(
     item: dict[str, Any],
     kind: str,
-    archetype: str,
-    tmdb_genres: dict[int, str],
-    igdb_genres: dict[int, str],
-    igdb_themes: dict[int, str],
+    names: set[str],
+    fallback: str = "",
 ) -> dict[str, float]:
-    vectors: list[tuple[float, ...]] = []
-    if kind == "movie":
-        vectors = [
-            TMDB_GENRE_CENTROIDS[name]
-            for genre_id in item.get("genre_ids", [])
-            if (name := tmdb_genres.get(int(genre_id))) in TMDB_GENRE_CENTROIDS
-        ]
+    moods = TMDB_MOODS if kind == "movie" else IGDB_MOODS
+    mapped = [moods[name] for name in sorted(names) if name in moods]
+    if mapped:
+        energy = sum(row[0] for row in mapped) / len(mapped)
+        valence = sum(row[1] for row in mapped) / len(mapped)
+        tempo = sum(row[2] for row in mapped) / len(mapped)
     else:
-        vectors = [
-            IGDB_GENRE_CENTROIDS[name]
-            for genre_id in item.get("genres", [])
-            if (name := igdb_genres.get(int(genre_id))) in IGDB_GENRE_CENTROIDS
-        ] + [
-            IGDB_THEME_CENTROIDS[name]
-            for theme_id in item.get("themes", [])
-            if (name := igdb_themes.get(int(theme_id))) in IGDB_THEME_CENTROIDS
-        ]
-    if not vectors:
-        return dict(zip(
-            DIMENSIONS,
-            next(entry.centroid for entry in ARCHETYPES if entry.name == archetype),
-            strict=True,
-        ))
+        archetype = next((row for row in ARCHETYPES if row.name == fallback), ARCHETYPES[0])
+        energy, valence, tempo = (archetype.centroid[index] for index in (0, 1, 5))
+    if kind == "movie":
+        era = _year_fraction(item.get("release_date"))
+        popularity = float(item.get("vote_count", 0) or 0)
+        mainstream = _clamp((math.log10(max(popularity, 1)) - 2.7) / 1.8)
+    else:
+        released = item.get("first_release_date")
+        year = datetime.fromtimestamp(float(released), tz=UTC).year if released else None
+        era = _year_fraction(year)
+        count = float(item.get("total_rating_count", 0) or 0)
+        mainstream = _clamp((math.log10(max(count, 1)) - 2) / 1.5)
+    if era is None:
+        era = 0.5
     return {
-        dim: sum(vector[index] for vector in vectors) / len(vectors)
-        for index, dim in enumerate(DIMENSIONS)
+        "energy": energy,
+        "valence": valence,
+        "tempo": tempo,
+        "era": era,
+        "mainstream": mainstream,
     }
 
 
-def _genre_set(item: dict[str, Any], kind: str, names: dict[int, str]) -> set[str]:
-    key = "genre_ids" if kind == "movie" else "genres"
-    return {names.get(int(value), str(value)) for value in item.get(key, [])}
+def _why(
+    family_id: str,
+    source: str,
+    item_id: str,
+    names: set[str],
+    user: dict[str, float],
+    title: dict[str, float],
+    anchor: str | None = None,
+    keyword: str | None = None,
+) -> str:
+    family = FAMILY_LABELS.get(family_id, family_id.replace("-", " ").title())
+    chosen = int.from_bytes(hashlib.sha256(item_id.encode()).digest()[:4], "big")
+    source = source if source in _SOURCE_TEMPLATES else "genre"
+    templates = _SOURCE_TEMPLATES[source]
+    if source == "anchor_rec":
+        return templates[chosen % len(templates)].format(
+            family=family, anchor=anchor or "a related title"
+        )
+    if source == "keyword":
+        term = keyword or next(
+            iter(sorted(FILM_PROFILES.get(family_id, FILM_PROFILES["pop"]).tmdb_keywords)), ""
+        )
+        return templates[chosen % len(templates)].format(family=family, keyword=term or "genre")
+    genre = next(iter(sorted(names)), "genre")
+    agreement = sorted(
+        (
+            (abs(_zscore(user[dim], dim)) + abs(_zscore(title[dim], dim)), dim)
+            for dim in COMPARABLE_DIMS
+        ),
+        reverse=True,
+    )
+    phrases = []
+    for _, dim in agreement:
+        left, right = _zscore(user[dim], dim), _zscore(title[dim], dim)
+        if left * right > 0:
+            phrases.append(DIM_PHRASES[dim][1 if left > 0 else 0])
+        if len(phrases) == 2:
+            break
+    for fallback_phrase in ("slow-burning", "moody"):
+        if len(phrases) >= 2:
+            break
+        if fallback_phrase not in phrases:
+            phrases.append(fallback_phrase)
+    return templates[chosen % len(templates)].format(genre=genre, p1=phrases[0], p2=phrases[1])
+
+
+def _explanation(user: dict[str, float], title: dict[str, float], title_id: str) -> str:
+    """Retain the generic explanation helper for existing prototype checks."""
+    candidates = []
+    for dim in DIMENSIONS:
+        left, right = _zscore(user[dim], dim), _zscore(title[dim], dim)
+        if left * right > 0 and abs(left) >= 0.3 and abs(right) >= 0.3:
+            candidates.append((abs(left) / (1 + abs(left - right)), dim, left))
+    candidates.sort(reverse=True)
+    phrases = [DIM_PHRASES[dim][1 if left > 0 else 0] for _, dim, left in candidates[:2]]
+    if len(phrases) == 2:
+        return f"A {phrases[0]}, {phrases[1]} pick for your listening."
+    if phrases:
+        return f"A {phrases[0]} pick for your listening."
+    return "Close to the sound of your top genres."
+
+
+def _quality(item: dict[str, Any], kind: str) -> float:
+    if kind == "movie":
+        rating = float(item.get("vote_average", 0) or 0)
+        count = max(float(item.get("vote_count", 0) or 0), 0)
+        return ((count / (count + 500)) * rating + (500 / (count + 500)) * 6.5) / 10
+    rating = float(item.get("total_rating", 0) or 0) / 100
+    count = max(float(item.get("total_rating_count", 0) or 0), 0)
+    return (count / (count + 100)) * rating + (100 / (count + 100)) * 0.70
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
@@ -210,132 +293,52 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(union) if union else 0.0
 
 
-def _safe_error_text(value: str) -> str:
-    return redact_secrets(value)[:160]
-
-
-def _log_catalog_failure(provider: str, result: Any) -> str:
-    detail = getattr(result, "error_detail", None) or getattr(result, "error_message", None)
-    detail = detail or f"HTTP {getattr(result, 'status', 'unknown')}"
-    detail = _safe_error_text(str(detail))
-    exception_name, _, message = detail.partition(":")
-    if not message:
-        exception_name, message = "UpstreamError", detail
-    endpoint = str(getattr(result, "endpoint", "unknown"))
-    logger.warning(
-        "upstream failure provider=%s endpoint=%s exception=%s message=%s",
-        provider,
-        endpoint,
-        exception_name[:60],
-        message.strip()[:120],
-    )
-    return detail
-
-
-def _explanation(user: dict[str, float], title: dict[str, float], title_id: str) -> str:
-    user_z = _standardize(tuple(user[dim] for dim in DIMENSIONS))
-    title_z = _standardize(tuple(title[dim] for dim in DIMENSIONS))
-    candidates = []
-    for index, dim in enumerate(DIMENSIONS):
-        left = user_z[index]
-        right = title_z[index]
-        if left == 0 or right == 0 or (left > 0) != (right > 0):
-            continue
-        if abs(left) < 0.3 or abs(right) < 0.3:
-            continue
-        agreement = abs(left) / (1 + abs(left - right))
-        candidates.append((agreement, index, dim))
-    candidates.sort(reverse=True)
-    phrases = [
-        DIM_PHRASES[dim][1 if user_z[index] >= 0 else 0]
-        for _, index, dim in candidates[:2]
-    ]
-    chosen = int.from_bytes(hashlib.sha256(title_id.encode()).digest()[:4], "big")
-    template_index = chosen % len(WHY_TEMPLATES)
-    if len(phrases) >= 2:
-        return WHY_TEMPLATES[template_index].format(p1=phrases[0], p2=phrases[1])
-    if phrases:
-        return WHY_ONE_DIM_TEMPLATES[template_index].format(phrase=phrases[0])
-    return "Close to the sound of your top genres."
-
-
-def _candidate(
-    item: dict[str, Any],
-    kind: str,
-    weight: float,
-    user: dict[str, float],
-    archetype: str,
-    tmdb_genres: dict[int, str],
-    igdb_genres: dict[int, str],
-    igdb_themes: dict[int, str],
-    tmdb_image_base: str,
-) -> dict[str, Any]:
-    vector = _title_vector(
-        item, kind, archetype, tmdb_genres, igdb_genres, igdb_themes
-    )
-    quality = (
-        float(item.get("vote_average", 0) or 0) / 10
-        if kind == "movie"
-        else float(item.get("total_rating", 0) or 0) / 100
-    )
-    novelty = 1.0 - abs(user["mainstream"] - vector["mainstream"])
-    raw_score = 0.60 * _cosine(user, vector) + 0.30 * quality + 0.10 * novelty
-    score = raw_score * weight
-    ids = _genre_set(item, kind, tmdb_genres if kind == "movie" else igdb_genres)
-    if kind == "movie":
-        title = str(item.get("title", ""))
-        year = str(item.get("release_date", ""))[:4] or None
-        poster = item.get("poster_path")
-        image_url = f"{tmdb_image_base}w342{poster}" if poster else None
-        source_url = f"https://www.themoviedb.org/movie/{item.get('id')}"
-    else:
-        title = str(item.get("name", ""))
-        released = item.get("first_release_date")
-        year = time.strftime("%Y", time.gmtime(released)) if released else None
-        cover = item.get("cover")
-        image_id = cover.get("image_id") if isinstance(cover, dict) else None
-        image_url = (
-            f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
-            if image_id
-            else None
-        )
-        source_url = f"https://www.igdb.com/games/{item.get('id')}"
-    return {
-        "id": str(item.get("id", "")),
-        "title": title,
-        "year": year,
-        "image_url": image_url,
-        "score": score,
-        "why": _explanation(user, vector, str(item.get("id", ""))),
-        "source_url": source_url,
-        "_genres": ids,
-        "_vector": vector,
-        "_weight": weight,
-    }
-
-
-def _mmr(candidates: list[dict[str, Any]], limit: int = TOP_K) -> list[dict[str, Any]]:
+def _mmr(
+    candidates: list[dict[str, Any]],
+    limit: int = TOP_K,
+    family_order: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Select family coverage first, then diversify remaining genre sets."""
     selected: list[dict[str, Any]] = []
     remaining = candidates.copy()
-    regional_count = 0
+    present_ids = {
+        candidate.get("matched_family", {}).get("id")
+        for candidate in candidates
+        if candidate.get("matched_family")
+    }
+    ordered_ids = family_order or list(dict.fromkeys(
+        candidate.get("matched_family", {}).get("id")
+        for candidate in candidates
+        if candidate.get("matched_family")
+    ))
+    quotas = {
+        family_id: 2 if index == 0 else 1
+        for index, family_id in enumerate(ordered_ids[:3])
+        if family_id in present_ids
+    }
+    for family_id, quota in quotas.items():
+        for _ in range(quota):
+            options = [
+                item for item in remaining if item.get("matched_family", {}).get("id") == family_id
+            ]
+            if not options or len(selected) >= limit:
+                break
+            pick = max(options, key=lambda item: item["score"])
+            selected.append(pick)
+            remaining.remove(pick)
     while remaining and len(selected) < limit:
-        eligible = [
-            item for item in remaining
-            if not item.get("regional") or regional_count < 3
-        ]
-        if not eligible:
-            break
-        best = max(
-            eligible,
-            key=lambda candidate: MMR_LAMBDA * candidate["score"]
-            - (1 - MMR_LAMBDA) * max(
-                (_jaccard(candidate["_genres"], prior["_genres"]) for prior in selected),
-                default=0.0,
+        pick = max(
+            remaining,
+            key=lambda item: (
+                MMR_LAMBDA * item["score"]
+                - (1 - MMR_LAMBDA)
+                * max(
+                    (_jaccard(item["_genres"], prior["_genres"]) for prior in selected), default=0
+                )
             ),
         )
-        remaining.remove(best)
-        selected.append(best)
-        regional_count += int(bool(best.get("regional")))
+        selected.append(pick)
+        remaining.remove(pick)
     picks = [
         {
             key: round(value, 4) if key == "score" else value
@@ -344,18 +347,16 @@ def _mmr(candidates: list[dict[str, Any]], limit: int = TOP_K) -> list[dict[str,
         }
         for item in selected
     ]
-    scores = [float(item["score"]) for item in picks]
-    minimum = min(scores, default=0.0)
-    maximum = max(scores, default=0.0)
-    span = maximum - minimum
+    scores = [item["score"] for item in picks]
+    low, high = min(scores, default=0), max(scores, default=0)
     for item in picks:
-        normalized = (float(item["score"]) - minimum) / span if span else 0.5
-        item["match_pct"] = round(72 + normalized * 25)
+        pct = (item["score"] - low) / (high - low) if high > low else 0.5
+        item["match_pct"] = round(72 + pct * 25)
     return picks
 
 
 class RankingService:
-    """Retrieve archetype candidate pools and rank them for one vibe vector."""
+    """Retrieve cached family pools, score candidates, and diversify picks."""
 
     def __init__(
         self,
@@ -372,105 +373,215 @@ class RankingService:
         self._memory: dict[str, tuple[float, dict[str, Any]]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def _pool(self, archetype: str, ids: dict[str, Any]) -> dict[str, Any]:
-        lock = self._locks.setdefault(archetype, asyncio.Lock())
+    async def _family_pool(self, family_id: str, ids: dict[str, Any]) -> dict[str, Any]:
+        lock = self._locks.setdefault(f"family:{family_id}", asyncio.Lock())
         async with lock:
-            return await self._load_pool(archetype, ids)
-
-    async def _load_pool(self, archetype: str, ids: dict[str, Any]) -> dict[str, Any]:
-        now = time.time()
-        if archetype in self._memory and self._memory[archetype][0] > now:
-            return self._memory[archetype][1]
-        key = f"pool:{archetype}"
-        cached = self.disk_cache.get(key)
-        if isinstance(cached, dict):
-            self._memory[archetype] = (now + self.ttl_seconds, cached)
-            return cached
-        stale_getter = getattr(self.disk_cache, "get_stale", None)
-        stale = stale_getter(key) if stale_getter else None
-        intent = INTENTS[archetype]
-        try:
-            movies = await _fetch_intent(self.clients, intent, ids, False)
-        except ConfigError:
-            raise
-        except Exception as exc:
-            detail = f"{type(exc).__name__}: {_safe_error_text(str(exc))}"
-            movies = {
-                "items": [],
-                "calls": [
-                    CatalogResult("discover/movie", None, None, "transport_error", detail, detail)
-                ],
-                "unresolved_keywords": list(intent["tmdb_keywords"]),
-                "keyword_errors": {name: type(exc).__name__ for name in intent["tmdb_keywords"]},
-                "degraded": True,
-            }
-        bodies = _igdb_query_bodies(intent, ids)
-        has_igdb_intents = any(ids.get("igdb_genres", {}).values()) or any(
-            ids.get("igdb_themes", {}).values()
-        )
-        if ids.get("igdb_available") and has_igdb_intents:
+            now = time.time()
+            cached = self._memory.get(family_id)
+            if cached and cached[0] > now:
+                return cached[1]
+            key = f"family-pool:{family_id}"
+            fresh = self.disk_cache.get(key)
+            if isinstance(fresh, dict):
+                self._memory[family_id] = (now + self.ttl_seconds, fresh)
+                return fresh
+            stale_getter = getattr(self.disk_cache, "get_stale", None)
+            stale = stale_getter(key) if stale_getter else None
             try:
-                igdb_result = await self.clients.igdb_multiquery(build_multiquery(bodies))
+                pool = await self._retrieve_family(family_id, ids)
             except ConfigError:
                 raise
             except Exception as exc:
-                detail = f"{type(exc).__name__}: {_safe_error_text(str(exc))}"
-                igdb_result = CatalogResult(
-                    "multiquery", None, None, "transport_error", detail, detail
+                logger.warning(
+                    "family retrieval failed family=%s error=%s: %s",
+                    family_id,
+                    type(exc).__name__,
+                    redact_secrets(str(exc))[:120],
                 )
-        else:
-            igdb_result = CatalogResult(
-                "multiquery", None, None, "configuration_error",
-                "No IGDB genre or theme IDs were available.",
-                "ConfigError: No IGDB genre or theme IDs were available.",
-            )
-        failed_movie_calls = [call for call in movies["calls"] if not call.ok]
-        failed_game_call = not igdb_result.ok
-        for call in movies["calls"]:
-            if not call.ok:
-                _log_catalog_failure("TMDB", call)
-        if failed_game_call:
-            _log_catalog_failure("IGDB", igdb_result)
-        movie_items = movies["items"]
-        game_items = _dedupe_games([igdb_result]) if igdb_result.ok else []
-        used_stale_movies = bool(failed_movie_calls and stale and stale.get("movies"))
-        used_stale_games = bool(failed_game_call and stale and stale.get("games"))
-        if used_stale_movies:
-            movie_items = stale["movies"]
-            logger.warning("serving stale catalog pool provider=TMDB endpoint=discover/movie")
-        if used_stale_games:
-            game_items = stale["games"]
-            logger.warning("serving stale catalog pool provider=IGDB endpoint=multiquery")
-        movies_failed = bool(failed_movie_calls) and not used_stale_movies and not any(
-            call.ok for call in movies["calls"]
+                pool = {
+                    "movies": [],
+                    "games": [],
+                    "degraded": True,
+                    "error": True,
+                    "movies_failed": True,
+                    "games_failed": True,
+                }
+            stale_served = False
+            if isinstance(stale, dict) and (pool.get("movies_failed") or pool.get("games_failed")):
+                pool = dict(pool)
+                for kind, failed in (
+                    ("movies", pool.get("movies_failed")),
+                    ("games", pool.get("games_failed")),
+                ):
+                    if failed and stale.get(kind):
+                        pool[kind] = stale[kind]
+                        pool.setdefault("sources", {}).update(stale.get("sources", {}))
+                        pool.setdefault("anchor_names", {}).update(stale.get("anchor_names", {}))
+                        stale_served = True
+                if stale_served:
+                    logger.warning("serving stale catalog pool family=%s", family_id)
+            if not stale_served and not pool.get("error"):
+                self.disk_cache.set(key, pool)
+            self._memory[family_id] = (now + self.ttl_seconds, pool)
+            return pool
+
+    async def _retrieve_family(self, family_id: str, ids: dict[str, Any]) -> dict[str, Any]:
+        film = FILM_PROFILES[family_id]
+        game = GAME_PROFILES[family_id]
+        movie_query_groups = family_tmdb_query_groups(film, ids)
+        movie_tasks = [self.clients.tmdb_discover(query) for _, query in movie_query_groups]
+        anchor_specs = [
+            self.clients.tmdb_search_movie(*_anchor_parts(anchor)) for anchor in film.anchors
+        ]
+        movie_calls = await asyncio.gather(*movie_tasks, *anchor_specs, return_exceptions=True)
+        movie_results = [value for value in movie_calls if isinstance(value, CatalogResult)]
+        retrieval_degraded = any(not isinstance(value, CatalogResult) for value in movie_calls)
+        for value in movie_calls:
+            if isinstance(value, Exception):
+                _log_exception("TMDB", "family movie retrieval", value)
+        for result in movie_results:
+            if not result.ok:
+                _log_failure("TMDB", result)
+        movie_items: dict[str, dict[str, Any]] = {}
+        sources: dict[str, dict[str, str]] = {}
+        anchor_names: dict[str, dict[str, str]] = {}
+        for source, query_result in zip(
+            [source for source, _ in movie_query_groups],
+            movie_calls[: len(movie_tasks)],
+            strict=True,
+        ):
+            if not isinstance(query_result, CatalogResult):
+                continue
+            result = query_result
+            for item in _items(result, "results"):
+                if item.get("id") is not None:
+                    key = str(item["id"])
+                    movie_items.setdefault(key, item)
+                    sources.setdefault(f"movie:{key}", {})[family_id] = source
+        for anchor, result in zip(film.anchors, movie_calls[len(movie_tasks) :], strict=False):
+            if not isinstance(result, CatalogResult):
+                continue
+            matches = _items(result, "results")
+            if not matches:
+                continue
+            anchor_id = matches[0].get("id")
+            if anchor_id is None:
+                continue
+            recommendation = await self.clients.tmdb_movie_recommendations(int(anchor_id))
+            if not recommendation.ok:
+                _log_failure("TMDB", recommendation)
+                retrieval_degraded = True
+            for item in _items(recommendation, "results"):
+                if item.get("id") is not None:
+                    key = str(item["id"])
+                    movie_items.setdefault(key, item)
+                    source_key = f"movie:{key}"
+                    sources.setdefault(source_key, {})[family_id] = "anchor_rec"
+                    anchor_names.setdefault(source_key, {})[family_id] = anchor.rsplit(" (", 1)[0]
+        game_bodies = family_igdb_bodies(game, ids)
+        game_results = await asyncio.gather(
+            *(self.clients.igdb_games(body) for body in game_bodies), return_exceptions=True
         )
-        games_failed = failed_game_call and not used_stale_games
-        keyword_reasons = {
-            name: movies.get("keyword_errors", {}).get(name, "no_match")
-            for name in movies.get("unresolved_keywords", [])
+        retrieval_degraded = retrieval_degraded or any(
+            not isinstance(result, CatalogResult) for result in game_results
+        )
+        for result in game_results:
+            if isinstance(result, Exception):
+                _log_exception("IGDB", "games", result)
+        for result in game_results:
+            if isinstance(result, CatalogResult) and not result.ok:
+                _log_failure("IGDB", result)
+        game_items: dict[str, dict[str, Any]] = {}
+        for result in game_results:
+            if not isinstance(result, CatalogResult):
+                continue
+            for item in _items(result):
+                if item.get("id") is not None:
+                    key = str(item["id"])
+                    game_items.setdefault(key, item)
+                    source = "genre"
+                    family_sources = sources.setdefault(f"game:{key}", {})
+                    if family_id not in family_sources:
+                        family_sources[family_id] = source
+        for anchor in game.anchors:
+            search = await self.clients.igdb_search_game(anchor)
+            if not search.ok:
+                _log_failure("IGDB", search)
+                retrieval_degraded = True
+            for record in _items(search):
+                similar = record.get("similar_games", [])
+                if not isinstance(similar, list):
+                    continue
+                result = await self.clients.igdb_games_by_ids(
+                    [int(value) for value in similar[:40]]
+                )
+                if not result.ok:
+                    _log_failure("IGDB", result)
+                    retrieval_degraded = True
+                for item in _items(result):
+                    if item.get("id") is not None:
+                        key = str(item["id"])
+                        game_items.setdefault(key, item)
+                        source_key = f"game:{key}"
+                        sources.setdefault(source_key, {})[family_id] = "anchor_rec"
+                        anchor_names.setdefault(source_key, {})[family_id] = anchor
+        failed_movies = not any(result.ok for result in movie_results)
+        failed_games = not any(
+            isinstance(result, CatalogResult) and result.ok for result in game_results
+        )
+        unresolved_keywords = [
+            name
+            for name in film.tmdb_keywords
+            if ids.get("tmdb_keywords", {}).get(name.casefold()) is None
+        ]
+        keyword_reasons = ids.get("unresolved_keywords", {})
+        degraded_reasons = [
+            f"TMDB keyword {name}: {keyword_reasons.get(name, 'no_match')}"
+            for name in unresolved_keywords
+        ]
+        return {
+            "movies": list(movie_items.values()),
+            "games": list(game_items.values()),
+            "sources": sources,
+            "anchor_names": anchor_names,
+            "error": failed_movies and failed_games,
+            "movies_failed": failed_movies,
+            "games_failed": failed_games,
+            "degraded_reasons": degraded_reasons,
+            "degraded": retrieval_degraded
+            or bool(degraded_reasons)
+            or any(not item.ok for item in movie_results)
+            or any(not isinstance(item, CatalogResult) or not item.ok for item in game_results),
         }
+
+    async def _pools_and_ids(
+        self, primary: str, secondary: str
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Retain compatibility for tests and development tools using archetype pools."""
+        ids = await _prepare(self.clients)
+        pools = await asyncio.gather(
+            self._archetype_pool(primary, ids), self._archetype_pool(secondary, ids)
+        )
+        return pools[0], pools[1], ids
+
+    async def _archetype_pool(self, archetype: str, ids: dict[str, Any]) -> dict[str, Any]:
+        key = f"legacy-pool:{archetype}"
+        cached = self.disk_cache.get(key)
+        if isinstance(cached, dict):
+            return cached
+        intent = INTENTS[archetype]
+        movie = await _fetch_intent(self.clients, intent, ids, False)
+        bodies = _igdb_query_bodies(intent, ids)
+        result = await self.clients.igdb_multiquery(build_multiquery(bodies))
         pool = {
-            "movies": movie_items,
-            "games": game_items,
-            "movies_failed": movies_failed,
-            "games_failed": games_failed,
-            "degraded": bool(failed_movie_calls or failed_game_call or movies["degraded"]),
-            "upstream_error": movies_failed and games_failed,
-            "unresolved_keywords": movies["unresolved_keywords"],
-            "keyword_errors": keyword_reasons,
-            "degraded_reasons": [
-                f"TMDB keyword {name}: {reason}" for name, reason in keyword_reasons.items()
-            ],
-            "provider_errors": [
-                {"provider": "TMDB", "endpoint": call.endpoint,
-                 "detail": call.error_detail or call.error_message or f"HTTP {call.status}"}
-                for call in failed_movie_calls
-            ] + ([{"provider": "IGDB", "endpoint": igdb_result.endpoint,
-                   "detail": igdb_result.error_detail or igdb_result.error_message or
-                   f"HTTP {igdb_result.status}"}] if failed_game_call else []),
+            "movies": movie["items"],
+            "games": _dedupe_games([result]) if result.ok else [],
+            "degraded": movie["degraded"] or not result.ok,
+            "movies_failed": not any(call.ok for call in movie["calls"]),
+            "games_failed": not result.ok,
+            "degraded_reasons": [],
         }
         self.disk_cache.set(key, pool)
-        self._memory[archetype] = (now + self.ttl_seconds, pool)
         return pool
 
     async def rank(
@@ -484,183 +595,233 @@ class RankingService:
         igdb_themes: list[dict[str, Any]] | None = None,
         top_families: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Return diversified movie and game recommendations from two pools."""
-        primary_pool, secondary_pool, ids = await self._pools_and_ids(primary, secondary)
+        """Return top recommendations based on the user's strongest families."""
+        ids = await _prepare(self.clients)
         for result in ids.get("boot_results", []):
-            if (hasattr(result, "ok") and not result.ok
-                    and "keyword:" not in result.endpoint
-                    and not result.endpoint.startswith("search/keyword")):
+            if hasattr(result, "ok") and not result.ok and "search/keyword:" not in result.endpoint:
                 provider = "TMDB" if result.endpoint.startswith(("genre/", "search/")) else "IGDB"
-                _log_catalog_failure(provider, result)
-        try:
-            configuration = await self.clients.tmdb_configuration()
-        except ConfigError:
-            raise
-        except Exception as exc:
-            detail = f"{type(exc).__name__}: {_safe_error_text(str(exc))}"
-            configuration = CatalogResult(
-                "configuration", None, None, "transport_error", detail, detail
-            )
+                _log_failure(provider, result)
+        families = [item for item in (top_families or []) if float(item.get("share", 0)) >= 0.08][
+            :4
+        ]
+        if not families:
+            families = [{"id": family, "share": 1 / 3} for family in list(FILM_PROFILES)[:3]]
+        family_ids = [str(item["id"]) for item in families if item.get("id") in FILM_PROFILES]
+        pools = await asyncio.gather(*(self._family_pool(fid, ids) for fid in family_ids))
+        configuration = await self.clients.tmdb_configuration()
         if not configuration.ok:
-            _log_catalog_failure("TMDB", configuration)
-        images = configuration.data.get("images", {}) if configuration.ok else {}
-        tmdb_image_base = (
-            str(images.get("secure_base_url", "https://image.tmdb.org/t/p/"))
-            if isinstance(images, dict)
-            else "https://image.tmdb.org/t/p/"
+            _log_failure("TMDB", configuration)
+        images = (
+            configuration.data.get("images", {})
+            if configuration.ok and isinstance(configuration.data, dict)
+            else {}
         )
-        tmdb_map = _id_name_map(tmdb_genres or ids["tmdb_genres"])
-        igdb_map = _id_name_map(igdb_genres or ids["igdb_genres"])
-        theme_map = _id_name_map(igdb_themes or ids["igdb_themes"])
-        movies = self._weighted_candidates(
-            primary_pool["movies"], secondary_pool["movies"], "movie", vector,
-            primary, secondary, tmdb_map, igdb_map, theme_map,
-            tmdb_image_base,
-        )
-        games = self._weighted_candidates(
-            primary_pool["games"], secondary_pool["games"], "game", vector,
-            primary, secondary, tmdb_map, igdb_map, theme_map,
-            tmdb_image_base,
-        )
-        regional_share = sum(
-            float(family.get("share", 0))
-            for family in (top_families or [])
-            if family.get("id") in REGIONAL_FAMILIES
-        )
-        regional_degraded = False
-        regional_unavailable = False
-        regional_items: list[dict[str, Any]] = []
-        if regional_share >= 0.25:
-            regional_items, regional_degraded, regional_unavailable = await self._regional_pool()
-            existing_ids = {str(item.get("id")) for item in movies}
-            for item in regional_items:
-                if str(item.get("id")) in existing_ids:
-                    continue
-                candidate = _candidate(
-                    item, "movie", 1.0, vector, primary,
-                    tmdb_map, igdb_map, theme_map, tmdb_image_base,
-                )
-                candidate["regional"] = True
-                movies.append(candidate)
-        movies_unavailable = all(
-            pool.get("movies_failed", False) for pool in (primary_pool, secondary_pool)
-        ) and not regional_items
-        games_unavailable = all(
-            pool.get("games_failed", False) for pool in (primary_pool, secondary_pool)
-        )
-        degraded_reasons = sorted({
-            reason
-            for pool in (primary_pool, secondary_pool)
-            for reason in pool.get("degraded_reasons", [])
-        })
-        if movies_unavailable:
-            degraded_reasons.append("movies unavailable")
-        if games_unavailable:
-            degraded_reasons.append("games unavailable")
-        if regional_unavailable:
-            degraded_reasons.append("regional movies unavailable")
-        degraded = any(pool.get("degraded", False) for pool in (primary_pool, secondary_pool))
-        degraded = degraded or regional_degraded or not configuration.ok
+        image_base = str(images.get("secure_base_url", "https://image.tmdb.org/t/p/"))
+        tmdb_map = _catalog_maps(tmdb_genres or _dict_list(ids.get("tmdb_genres", {})))
+        igdb_map = _catalog_maps(igdb_genres or _dict_list(ids.get("igdb_genres", {})))
+        theme_map = _catalog_maps(igdb_themes or _dict_list(ids.get("igdb_themes", {})))
+        movie_rows = _merge_family_items(pools, family_ids, "movies")
+        game_rows = _merge_family_items(pools, family_ids, "games")
+        if len(movie_rows) < 30 or len(game_rows) < 30:
+            fallback = await asyncio.gather(
+                self._archetype_pool(primary, ids), self._archetype_pool(secondary, ids)
+            )
+            for kind, rows in (("movies", movie_rows), ("games", game_rows)):
+                if len(rows) < 30:
+                    existing = {str(item["item"].get("id")) for item in rows}
+                    for pool in fallback:
+                        for item in pool[kind]:
+                            if str(item.get("id")) not in existing:
+                                rows.append({"item": item, "sources": {}, "shares": {}})
+                                existing.add(str(item.get("id")))
+        movies = [
+            _score_candidate(row, "movie", vector, primary, families, tmdb_map, {}, {}, image_base)
+            for row in movie_rows
+        ]
+        games = [
+            _score_candidate(
+                row, "game", vector, primary, families, tmdb_map, igdb_map, theme_map, image_base
+            )
+            for row in game_rows
+        ]
+        unavailable_movie = not movie_rows
+        unavailable_game = not game_rows
+        degraded_reasons = {reason for pool in pools for reason in pool.get("degraded_reasons", [])}
+        if unavailable_movie:
+            degraded_reasons.add("movies unavailable")
+        if unavailable_game:
+            degraded_reasons.add("games unavailable")
+        if not configuration.ok:
+            degraded_reasons.add("TMDB image configuration unavailable")
         return {
-            "movies": [] if movies_unavailable else _mmr(movies),
-            "games": [] if games_unavailable else _mmr(games),
-            "degraded": degraded,
-            "upstream_error": movies_unavailable and games_unavailable,
+            "movies": _mmr(movies, family_order=family_ids),
+            "games": _mmr(games, family_order=family_ids),
+            "degraded": any(pool.get("degraded") for pool in pools) or not configuration.ok,
+            "upstream_error": unavailable_movie and unavailable_game,
             "failed_providers": [
                 provider
-                for provider, failed in (("TMDB", movies_unavailable), ("IGDB", games_unavailable))
+                for provider, failed in (("TMDB", unavailable_movie), ("IGDB", unavailable_game))
                 if failed
             ],
-            "degraded_reasons": degraded_reasons,
+            "degraded_reasons": sorted(degraded_reasons),
         }
 
-    async def _regional_pool(self) -> tuple[list[dict[str, Any]], bool, bool]:
-        key = "regional:movies:hi-pa-ta-te"
-        fresh = self.disk_cache.get(key)
-        if isinstance(fresh, list):
-            return fresh, False, False
-        stale_getter = getattr(self.disk_cache, "get_stale", None)
-        stale = stale_getter(key) if stale_getter else None
-        queries = [
-            {
-                "include_adult": "false",
-                "sort_by": "popularity.desc",
-                "vote_count.gte": 500,
-                "vote_average.gte": 6,
-                "with_original_language": "hi|pa|ta|te",
-                "page": page,
-            }
-            for page in (1, 2)
-        ]
-        calls = await asyncio.gather(*(
-            self.clients.tmdb_discover(query) for query in queries
-        ), return_exceptions=True)
-        valid: list[CatalogResult] = []
-        failed: list[CatalogResult] = []
-        for call in calls:
-            if isinstance(call, Exception):
-                if isinstance(call, ConfigError):
-                    raise call
-                detail = f"{type(call).__name__}: {_safe_error_text(str(call))}"
-                call = CatalogResult(
-                    "discover/movie", None, None, "transport_error", detail, detail
-                )
-            if call.ok:
-                valid.append(call)
-            else:
-                failed.append(call)
-                _log_catalog_failure("TMDB", call)
-        found = []
-        for call in valid:
-            response = call.data.get("results", []) if isinstance(call.data, dict) else []
-            if isinstance(response, list):
-                found.extend(item for item in response if isinstance(item, dict))
-        deduped = list({
-            str(item["id"]): item for item in reversed(found) if item.get("id") is not None
-        }.values())
-        if failed and not valid and isinstance(stale, list):
-            logger.warning("serving stale catalog pool provider=TMDB endpoint=regional-movies")
-            return stale, True, False
-        if valid:
-            self.disk_cache.set(key, deduped)
-        return deduped, bool(failed), bool(failed and not valid and stale is None)
 
-    async def _pools_and_ids(
-        self, primary: str, secondary: str
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        ids = await _prepare(self.clients)
-        primary_pool, secondary_pool = await asyncio.gather(
-            self._pool(primary, ids), self._pool(secondary, ids)
-        )
-        return primary_pool, secondary_pool, ids
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return []
+    return [
+        {"id": identifier, "name": name}
+        for name, identifier in value.items()
+        if isinstance(identifier, int)
+    ]
 
-    @staticmethod
-    def _weighted_candidates(
-        primary_items: list[dict[str, Any]],
-        secondary_items: list[dict[str, Any]],
-        kind: str,
-        vector: dict[str, float],
-        primary: str,
-        secondary: str,
-        tmdb_map: dict[int, str],
-        igdb_map: dict[int, str],
-        theme_map: dict[int, str],
-        tmdb_image_base: str,
-    ) -> list[dict[str, Any]]:
-        combined: dict[str, tuple[dict[str, Any], float, str]] = {}
-        for item in primary_items:
-            combined[str(item.get("id"))] = (item, 0.7, primary)
-        for item in secondary_items:
-            key = str(item.get("id"))
-            if key in combined:
-                existing_item, existing_weight, existing_archetype = combined[key]
-                combined[key] = (existing_item, existing_weight + 0.3, existing_archetype)
-            else:
-                combined[key] = (item, 0.3, secondary)
-        return [
-            _candidate(
-                item, kind, weight, vector, archetype,
-                tmdb_map, igdb_map, theme_map, tmdb_image_base,
+
+def _merge_family_items(
+    pools: list[dict[str, Any]], family_ids: list[str], key: str
+) -> list[dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for family_id, pool in zip(family_ids, pools, strict=True):
+        for item in pool.get(key, []):
+            item_id = str(item.get("id", ""))
+            if not item_id:
+                continue
+            row = found.setdefault(
+                item_id, {"item": item, "sources": {}, "shares": {}, "anchors": {}}
             )
-            for item, weight, archetype in combined.values()
-        ]
+            source_key = f"{'movie' if key == 'movies' else 'game'}:{item_id}"
+            row["sources"][family_id] = (
+                pool.get("sources", {}).get(source_key, {}).get(family_id, "genre")
+            )
+            row["anchors"][family_id] = (
+                pool.get("anchor_names", {}).get(source_key, {}).get(family_id)
+            )
+    return list(found.values())
+
+
+def _score_candidate(
+    row: dict[str, Any],
+    kind: str,
+    user: dict[str, float],
+    fallback: str,
+    families: list[dict[str, Any]],
+    tmdb_map: dict[Any, str],
+    igdb_map: dict[Any, str],
+    theme_map: dict[Any, str],
+    image_base: str,
+) -> dict[str, Any]:
+    item = row["item"]
+    names = _genre_names(item, kind, tmdb_map if kind == "movie" else igdb_map)
+    if kind == "game":
+        names.update(_genre_names({"themes": item.get("themes", [])}, "game", theme_map))
+    title = _title_vector(item, kind, names, fallback)
+    sources = row.get("sources", {})
+    shares = {str(family["id"]): float(family.get("share", 0)) for family in families}
+    denominator = sum(shares.values()) or 1
+    affinity = (
+        sum(
+            shares[family_id] * _source_match(source, family_id)
+            for family_id, source in sources.items()
+            if family_id in shares
+        )
+        / denominator
+    )
+    vibe = (_comparable_cosine(user, title) + 1) / 2
+    quality = _quality(item, kind)
+    fit = 0.5 * (1 - abs(user["era"] - title["era"])) + 0.5 * (
+        1 - abs(user["mainstream"] - title["mainstream"])
+    )
+    score = 0.45 * affinity + 0.20 * vibe + 0.20 * quality + 0.15 * fit
+    matched_id = max(
+        sources,
+        key=lambda family_id: (
+            shares.get(family_id, 0) * _source_match(sources[family_id], family_id)
+        ),
+        default=None,
+    )
+    matched_id = matched_id or (next(iter(shares)) if shares else "pop")
+    matched_source = sources.get(matched_id, "genre")
+    anchor = row.get("anchors", {}).get(matched_id)
+    why = _why(
+        matched_id,
+        matched_source,
+        str(item.get("id", "")),
+        names,
+        user,
+        title,
+        anchor,
+        next(iter(sorted(names)), None) if kind == "game" else None,
+    )
+    if kind == "movie":
+        title_text = str(item.get("title", ""))
+        year = str(item.get("release_date", ""))[:4] or None
+        poster = item.get("poster_path")
+        image = f"{image_base}w342{poster}" if poster else None
+        source_url = f"https://www.themoviedb.org/movie/{item.get('id')}"
+    else:
+        title_text = str(item.get("name", ""))
+        released = item.get("first_release_date")
+        year = str(datetime.fromtimestamp(float(released), tz=UTC).year) if released else None
+        cover = item.get("cover")
+        cover_id = cover.get("image_id") if isinstance(cover, dict) else None
+        image = (
+            f"https://images.igdb.com/igdb/image/upload/t_cover_big/{cover_id}.jpg"
+            if cover_id
+            else None
+        )
+        source_url = f"https://www.igdb.com/games/{item.get('id')}"
+    return {
+        "id": str(item.get("id", "")),
+        "title": title_text,
+        "year": year,
+        "image_url": image,
+        "score": score,
+        "why": why,
+        "source_url": source_url,
+        "matched_family": {"id": matched_id, "label": FAMILY_LABELS.get(matched_id, matched_id)},
+        "reason_source": matched_source,
+        "_genres": names,
+    }
+
+
+def _source_match(source: str, family_id: str) -> float:
+    if source == "anchor_rec":
+        return 1.0
+    if source == "keyword":
+        return 0.7
+    if source in {"language", "genre_language"}:
+        return 0.5
+    profile = FILM_PROFILES.get(family_id)
+    return 0.5 if profile and profile.original_languages else 0.3
+
+
+def _log_failure(provider: str, result: CatalogResult) -> None:
+    """Log an upstream catalog error without exposing configured credentials."""
+    detail = result.error_detail or result.error_message or f"HTTP {result.status}"
+    detail = redact_secrets(str(detail))
+    error_type, separator, message = detail.partition(":")
+    if not separator:
+        error_type, message = "UpstreamError", detail
+    logger.warning(
+        "upstream failure provider=%s endpoint=%s exception=%s message=%s",
+        provider,
+        result.endpoint,
+        error_type[:60],
+        message.strip()[:120],
+    )
+
+
+def _log_exception(provider: str, endpoint: str, error: Exception) -> None:
+    """Log an upstream transport exception safely."""
+    logger.warning(
+        "upstream failure provider=%s endpoint=%s exception=%s message=%s",
+        provider,
+        endpoint,
+        type(error).__name__[:60],
+        redact_secrets(str(error))[:120],
+    )
+
+
+def _anchor_parts(anchor: str) -> tuple[str, str | None]:
+    match = re.match(r"^(.*?)\s*\((\d{4})\)$", anchor)
+    return (match.group(1), match.group(2)) if match else (anchor, None)

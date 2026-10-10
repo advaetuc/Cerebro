@@ -78,9 +78,7 @@ def clean_env_value(name: str, value: str | None = None) -> str:
 def redact_secrets(message: str) -> str:
     """Remove configured credentials from upstream error messages."""
     cleaned = str(message)
-    for name in (
-        "LASTFM_API_KEY", "TMDB_READ_TOKEN", "TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET"
-    ):
+    for name in ("LASTFM_API_KEY", "TMDB_READ_TOKEN", "TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET"):
         secret = clean_env_value(name)
         if len(secret) >= 4:
             cleaned = cleaned.replace(secret, "[redacted]")
@@ -91,7 +89,6 @@ def redact_secrets(message: str) -> str:
         cleaned,
     )
     return cleaned.replace("\n", " ")
-
 
 
 def build_headers(values: dict[str, tuple[str, str]]) -> dict[str, str]:
@@ -107,7 +104,6 @@ def build_headers(values: dict[str, tuple[str, str]]) -> dict[str, str]:
             ) from exc
         headers[header] = cleaned
     return headers
-
 
 
 def token_is_valid(expires_at: float, now: float | None = None) -> bool:
@@ -134,11 +130,7 @@ class CatalogResult:
     @property
     def ok(self) -> bool:
         """Return whether the response has no transport or API error."""
-        return (
-            isinstance(self.status, int)
-            and self.status < 400
-            and self.error_code is None
-        )
+        return isinstance(self.status, int) and self.status < 400 and self.error_code is None
 
 
 class AsyncRateLimiter:
@@ -208,9 +200,7 @@ def tmdb_backoff_delay(
     return base + spread
 
 
-def select_keyword_match(
-    results: list[dict[str, Any]], keyword: str
-) -> dict[str, Any] | None:
+def select_keyword_match(results: list[dict[str, Any]], keyword: str) -> dict[str, Any] | None:
     """Choose exact-name match, otherwise the highest-ranked search result."""
     wanted = keyword.strip().casefold()
     for result in results:
@@ -311,9 +301,7 @@ def _api_error(response: httpx.Response, payload: Any) -> tuple[str | int | None
         return payload["status_code"], str(payload.get("status_message", payload))[:200]
     if isinstance(payload, list):
         for first in payload:
-            if isinstance(first, dict) and (
-                first.get("status") == "error" or first.get("error")
-            ):
+            if isinstance(first, dict) and (first.get("status") == "error" or first.get("error")):
                 return first.get("error", "api_error"), str(first.get("message", first))[:200]
     return None, None
 
@@ -449,8 +437,7 @@ class CatalogClients:
                     detail = result.error_detail
                     if result.status is not None and result.status != "no_match" and not result.ok:
                         status_error = (
-                            f"HTTPStatusError: HTTP {result.status}: "
-                            f"{result.error_message or ''}"
+                            f"HTTPStatusError: HTTP {result.status}: {result.error_message or ''}"
                         )
                         detail = detail or status_error[:120]
                     return self._with_metrics(
@@ -555,10 +542,12 @@ class CatalogClients:
         if not self.tmdb_token:
             raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
         result = await self._request(
-            "GET", f"{TMDB_BASE}/genre/movie/list", key,
-            headers=build_headers({
-                "Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")
-            }),
+            "GET",
+            f"{TMDB_BASE}/genre/movie/list",
+            key,
+            headers=build_headers(
+                {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+            ),
             params={"language": "en-US"},
         )
         if result.ok and isinstance(result.data, dict):
@@ -574,10 +563,12 @@ class CatalogClients:
         if not self.tmdb_token:
             raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
         result = await self._request(
-            "GET", f"{TMDB_BASE}/configuration", key,
-            headers=build_headers({
-                "Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")
-            }),
+            "GET",
+            f"{TMDB_BASE}/configuration",
+            key,
+            headers=build_headers(
+                {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+            ),
         )
         if result.ok and isinstance(result.data, dict):
             self.cache.set(key, result.data)
@@ -605,10 +596,12 @@ class CatalogClients:
         if not self.tmdb_token:
             raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
         result = await self._request(
-            "GET", f"{TMDB_BASE}/search/keyword", key,
-            headers=build_headers({
-                "Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")
-            }),
+            "GET",
+            f"{TMDB_BASE}/search/keyword",
+            key,
+            headers=build_headers(
+                {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+            ),
             params={"query": name, "page": 1},
         )
         if not result.ok or not isinstance(result.data, dict):
@@ -654,14 +647,55 @@ class CatalogClients:
         if not self.tmdb_token:
             raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
         result = await self._request(
-            "GET", f"{TMDB_BASE}/discover/movie", "discover/movie",
-            headers=build_headers({
-                "Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")
-            }), params=params,
+            "GET",
+            f"{TMDB_BASE}/discover/movie",
+            "discover/movie",
+            headers=build_headers(
+                {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+            ),
+            params=params,
         )
         if not cold:
             self._result_cache[key] = result
         return result
+
+    async def tmdb_search_movie(self, title: str, year: str | None = None) -> CatalogResult:
+        """Search for a film anchor by title and optional release year."""
+        if not self.tmdb_token:
+            raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
+        params: dict[str, str | int] = {"query": title, "page": 1}
+        if year:
+            params["year"] = year
+        key = "tmdb:search/movie:" + json.dumps(params, sort_keys=True)
+        cached = self._cached_ids(key)
+        if cached is not None:
+            return CatalogResult("search/movie", 200, {"results": cached})
+        result = await self._request(
+            "GET",
+            f"{TMDB_BASE}/search/movie",
+            "search/movie",
+            headers=build_headers(
+                {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+            ),
+            params=params,
+        )
+        if result.ok and isinstance(result.data, dict):
+            self.cache.set(key, result.data.get("results", []))
+        return result
+
+    async def tmdb_movie_recommendations(self, movie_id: int) -> CatalogResult:
+        """Fetch first-page recommendations for a known film anchor."""
+        if not self.tmdb_token:
+            raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
+        return await self._request(
+            "GET",
+            f"{TMDB_BASE}/movie/{movie_id}/recommendations",
+            "movie/recommendations",
+            headers=build_headers(
+                {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+            ),
+            params={"page": 1},
+        )
 
     async def igdb_token(self) -> CatalogResult:
         """Load or obtain the Twitch client-credentials token."""
@@ -682,11 +716,11 @@ class CatalogClients:
         except (OSError, ValueError, KeyError, TypeError):
             pass
         if not self.client_id or not self.client_secret:
-            raise ConfigError(
-                "Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in services/api/.env"
-            )
+            raise ConfigError("Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in services/api/.env")
         result = await self._request(
-            "POST", TWITCH_TOKEN_URL, "oauth/token",
+            "POST",
+            TWITCH_TOKEN_URL,
+            "oauth/token",
             data={
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
@@ -699,7 +733,10 @@ class CatalogClients:
         expires_in = result.data.get("expires_in")
         if not access_token or not isinstance(expires_in, (int, float)):
             return CatalogResult(
-                "oauth/token", result.status, result.data, "invalid_token_response",
+                "oauth/token",
+                result.status,
+                result.data,
+                "invalid_token_response",
                 "Token response omitted token or expiry",
                 error_detail="ValueError: Token response omitted token or expiry",
                 attempt=result.attempt,
@@ -731,12 +768,17 @@ class CatalogClients:
             return token
         body = "fields id,name; limit 500;"
         result = await self._request(
-            "POST", f"{IGDB_BASE}/{endpoint}", key,
-            headers=build_headers({
-                "Client-ID": ("TWITCH_CLIENT_ID", self.client_id),
-                "Authorization": ("TWITCH_CLIENT_ID", f"Bearer {self._token}"),
-            }),
-            content=body, igdb=True,
+            "POST",
+            f"{IGDB_BASE}/{endpoint}",
+            key,
+            headers=build_headers(
+                {
+                    "Client-ID": ("TWITCH_CLIENT_ID", self.client_id),
+                    "Authorization": ("TWITCH_CLIENT_ID", f"Bearer {self._token}"),
+                }
+            ),
+            content=body,
+            igdb=True,
         )
         if result.ok and isinstance(result.data, list):
             self.cache.set(key, result.data)
@@ -750,9 +792,7 @@ class CatalogClients:
         """Fetch IGDB themes."""
         return await self._igdb_ids("themes")
 
-    async def igdb_games(
-        self, body: str, *, cold: bool = False
-    ) -> CatalogResult:
+    async def igdb_games(self, body: str, *, cold: bool = False) -> CatalogResult:
         """Query games; cold calls bypass the in-memory result cache."""
         key = "igdb:games:" + body
         if not cold and key in self._result_cache:
@@ -761,20 +801,44 @@ class CatalogClients:
         if not token.ok:
             return token
         result = await self._request(
-            "POST", f"{IGDB_BASE}/games", "games",
-            headers=build_headers({
-                "Client-ID": ("TWITCH_CLIENT_ID", self.client_id),
-                "Authorization": ("TWITCH_CLIENT_ID", f"Bearer {self._token}"),
-            }),
-            content=body, igdb=True,
+            "POST",
+            f"{IGDB_BASE}/games",
+            "games",
+            headers=build_headers(
+                {
+                    "Client-ID": ("TWITCH_CLIENT_ID", self.client_id),
+                    "Authorization": ("TWITCH_CLIENT_ID", f"Bearer {self._token}"),
+                }
+            ),
+            content=body,
+            igdb=True,
         )
         if not cold:
             self._result_cache[key] = result
         return result
 
-    async def igdb_multiquery(
-        self, body: str, *, cold: bool = False
-    ) -> CatalogResult:
+    async def igdb_search_game(self, name: str) -> CatalogResult:
+        """Search IGDB for an anchor game and its similar-game IDs."""
+        escaped = name.replace('"', '\\"')
+        body = (
+            f'search "{escaped}"; fields id,name,similar_games; limit 5; '
+            "where total_rating_count >= 100 & total_rating >= 65;"
+        )
+        return await self.igdb_games(body)
+
+    async def igdb_games_by_ids(self, ids: list[int]) -> CatalogResult:
+        """Fetch full candidate records for similar-game IDs."""
+        if not ids:
+            return CatalogResult("games", 200, [])
+        body = (
+            "fields id,name,first_release_date,total_rating,total_rating_count,"
+            "genres,themes,cover; "
+            f"where id = ({','.join(map(str, ids))}) & total_rating_count >= 100 "
+            "& total_rating >= 65; limit 40; sort total_rating desc;"
+        )
+        return await self.igdb_games(body)
+
+    async def igdb_multiquery(self, body: str, *, cold: bool = False) -> CatalogResult:
         """Submit several IGDB games subqueries in one HTTP request."""
         key = "igdb:multiquery:" + body
         if not cold and key in self._result_cache:
@@ -786,10 +850,12 @@ class CatalogClients:
             "POST",
             f"{IGDB_BASE}/multiquery",
             "multiquery",
-            headers=build_headers({
-                "Client-ID": ("TWITCH_CLIENT_ID", self.client_id),
-                "Authorization": ("TWITCH_CLIENT_ID", f"Bearer {self._token}"),
-            }),
+            headers=build_headers(
+                {
+                    "Client-ID": ("TWITCH_CLIENT_ID", self.client_id),
+                    "Authorization": ("TWITCH_CLIENT_ID", f"Bearer {self._token}"),
+                }
+            ),
             content=body,
             igdb=True,
         )
@@ -816,10 +882,12 @@ class CatalogClients:
                 if not self.tmdb_token:
                     raise ConfigError("Set TMDB_READ_TOKEN in services/api/.env")
                 result = await self._request(
-                    "GET", f"{TMDB_BASE}/configuration", "configuration",
-                    headers=build_headers({
-                        "Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")
-                    }),
+                    "GET",
+                    f"{TMDB_BASE}/configuration",
+                    "configuration",
+                    headers=build_headers(
+                        {"Authorization": ("TMDB_READ_TOKEN", f"Bearer {self.tmdb_token}")}
+                    ),
                     extensions={"trace": trace},
                 )
             elif host == "igdb":
@@ -834,12 +902,8 @@ class CatalogClients:
                 raise ValueError(f"Unknown catalog host: {host}")
             if result.status is None and result.error_detail:
                 return {"error": result.error_detail[:120]}
-            tcp_ms = (
-                trace_times["tcp_complete"] - trace_times["tcp_started"]
-            ) * 1000
-            tls_ms = (
-                trace_times["tls_complete"] - trace_times["tls_started"]
-            ) * 1000
+            tcp_ms = (trace_times["tcp_complete"] - trace_times["tcp_started"]) * 1000
+            tls_ms = (trace_times["tls_complete"] - trace_times["tls_started"]) * 1000
             return {
                 "tcp_ms": round(tcp_ms, 2),
                 "tls_ms": round(tls_ms, 2),
@@ -873,9 +937,7 @@ def build_tmdb_params(
     return params
 
 
-def build_apicalypse(
-    genre_ids: list[int], theme_ids: list[int], mode: str = "combined"
-) -> str:
+def build_apicalypse(genre_ids: list[int], theme_ids: list[int], mode: str = "combined") -> str:
     """Build an IGDB games query using runtime-resolved genre/theme IDs."""
     clauses = ["total_rating_count >= 100", "total_rating >= 65"]
     if genre_ids and mode in {"combined", "genres"}:
@@ -891,6 +953,4 @@ def build_apicalypse(
 
 def build_multiquery(queries: list[tuple[str, str]]) -> str:
     """Combine labeled Apicalypse queries into one IGDB multiquery body."""
-    return " ".join(
-        f'query games "{label}" {{ {body} }};' for label, body in queries
-    )
+    return " ".join(f'query games "{label}" {{ {body} }};' for label, body in queries)
